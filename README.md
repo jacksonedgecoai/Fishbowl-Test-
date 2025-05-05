@@ -1,443 +1,174 @@
-const express = require('express');
-const cors = require('cors');
-const net = require('net');
-const xml2js = require('xml2js');
-require('dotenv').config();
+# Fishbowl MCP Server
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+A middleware server for integrating with Fishbowl Inventory API.
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+## Overview
 
-// XML parser and builder
-const xmlParser = new xml2js.Parser();
-const xmlBuilder = new xml2js.Builder();
+This MCP (Message Control Program) server provides a RESTful API that communicates with your Fishbowl Inventory software. It handles authentication, token management, and proxies all requests to the Fishbowl API.
 
-// Fishbowl API Client
-class FishbowlClient {
-  constructor() {
-    // Use environment variables as described in your documentation
-    this.host = process.env.FISHBOWL_HOST || 'localhost';
-    this.port = parseInt(process.env.FISHBOWL_PORT) || 28192;
-    this.username = process.env.FISHBOWL_USERNAME;
-    this.password = process.env.FISHBOWL_PASSWORD;
-    this.iaid = process.env.FISHBOWL_IAID || '54321';
-    this.sessionToken = null;
-    this.userId = null;
-  }
+## Features
 
-  async connect() {
-    return new Promise((resolve, reject) => {
-      this.client = new net.Socket();
-      this.client.connect(this.port, this.host, () => {
-        console.log('Connected to Fishbowl server');
-        resolve();
-      });
+- Automatic authentication with Fishbowl API
+- Simplified API access to Fishbowl functionality
+- Support for parts, inventory, purchase orders, and manufacture orders
+- Memo management for POs and MOs
+- Vendor, UOM, user, and product endpoints
 
-      this.client.on('error', (error) => {
-        console.error('Connection error:', error);
-        reject(error);
-      });
-    });
-  }
+## Prerequisites
 
-  async sendRequest(requestXml) {
-    return new Promise((resolve, reject) => {
-      if (!this.client) {
-        reject(new Error('Not connected to Fishbowl server'));
-        return;
-      }
+- Node.js 18 or higher
+- Fishbowl Inventory software with API access
+- Access credentials for Fishbowl
 
-      let responseData = '';
-      
-      // Set up a temporary data listener for this request
-      const dataHandler = (data) => {
-        responseData += data.toString();
-        // Check if we have received the complete response
-        if (responseData.includes('</FbiXml>')) {
-          this.client.removeListener('data', dataHandler);
-          resolve(responseData);
-        }
-      };
+## Local Development Setup
 
-      this.client.on('data', dataHandler);
+1. Clone this repository:
+   ```
+   git clone https://your-repo-url/fishbowl-mcp-server.git
+   cd fishbowl-mcp-server
+   ```
 
-      this.client.on('error', (error) => {
-        this.client.removeListener('data', dataHandler);
-        reject(error);
-      });
+2. Install dependencies:
+   ```
+   npm install
+   ```
 
-      // Send the request
-      this.client.write(requestXml);
-    });
-  }
+3. Create a `.env` file based on the template:
+   ```
+   cp .env.template .env
+   ```
 
-  async login() {
-    if (!this.client) {
-      await this.connect();
-    }
+4. Edit the `.env` file with your Fishbowl credentials and API URL.
 
-    const loginRequest = {
-      FbiXml: {
-        $: { version: '1.0' },
-        Ticket: {},
-        FbiMsgsRq: {
-          LoginRq: {
-            IAID: this.iaid,
-            IAName: 'MCP Fishbowl Server',
-            IADescription: 'MCP Server for Fishbowl Integration',
-            UserName: this.username,
-            UserPassword: this.password
-          }
-        }
-      }
-    };
+5. Start the development server:
+   ```
+   npm run dev
+   ```
 
-    const requestXml = xmlBuilder.buildObject(loginRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
+## Deploying to Railway
 
-    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
-        result.FbiXml.FbiMsgsRs[0].LoginRs && 
-        result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusCode &&
-        result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusCode[0] === '1000') {
-      
-      if (result.FbiXml.Ticket && result.FbiXml.Ticket[0]) {
-        this.sessionToken = result.FbiXml.Ticket[0].Key[0];
-        this.userId = result.FbiXml.Ticket[0].UserID[0];
-        console.log('Successfully logged in to Fishbowl');
-        return { success: true, token: this.sessionToken };
-      }
-    }
-    
-    // Extract error details if available
-    const statusMessage = result.FbiXml && 
-                           result.FbiXml.FbiMsgsRs && 
-                           result.FbiXml.FbiMsgsRs[0].LoginRs && 
-                           result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusMessage ?
-                           result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusMessage[0] : 'Unknown error';
-    
-    throw new Error(`Login failed: ${statusMessage}`);
-  }
+1. Create a Railway account at [railway.app](https://railway.app) if you don't have one.
 
-  async ensureAuthenticated() {
-    if (!this.sessionToken) {
-      await this.login();
-    }
-    return this.sessionToken;
-  }
+2. Install the Railway CLI:
+   ```
+   npm i -g @railway/cli
+   ```
 
-  async getInventory(partNumber) {
-    await this.ensureAuthenticated();
+3. Login to Railway:
+   ```
+   railway login
+   ```
 
-    const inventoryRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          PartQuantityRq: {
-            PartNum: partNumber
-          }
-        }
-      }
-    };
+4. Initialize your project:
+   ```
+   railway init
+   ```
 
-    const requestXml = xmlBuilder.buildObject(inventoryRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
+5. Add your environment variables:
+   ```
+   railway variables set FISHBOWL_API_URL=http://your-fishbowl-server-address:port
+   railway variables set FISHBOWL_APP_NAME="MCP Server"
+   railway variables set FISHBOWL_APP_ID=101
+   railway variables set FISHBOWL_USERNAME=your-username
+   railway variables set FISHBOWL_PASSWORD=your-password
+   ```
 
-    // Check for errors
-    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
-        result.FbiXml.FbiMsgsRs[0].PartQuantityRs && 
-        result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusCode &&
-        result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusCode[0] !== '1000') {
-      
-      const statusMessage = result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusMessage ?
-                            result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusMessage[0] : 'Unknown error';
-      
-      throw new Error(`Failed to get inventory: ${statusMessage}`);
-    }
+6. Deploy your application:
+   ```
+   railway up
+   ```
 
-    return result;
-  }
+7. Open your deployed application:
+   ```
+   railway open
+   ```
 
-  async getProducts() {
-    await this.ensureAuthenticated();
+## API Endpoints
 
-    const productsRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          ProductGetRq: {
-            GetAll: true
-          }
-        }
-      }
-    };
+### Authentication
 
-    const requestXml = xmlBuilder.buildObject(productsRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
+- `POST /api/login` - Log in to Fishbowl API
+- `POST /api/logout` - Log out from Fishbowl API
 
-    // Check for errors
-    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
-        result.FbiXml.FbiMsgsRs[0].ProductGetRs && 
-        result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusCode &&
-        result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusCode[0] !== '1000') {
-      
-      const statusMessage = result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusMessage ?
-                            result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusMessage[0] : 'Unknown error';
-      
-      throw new Error(`Failed to get products: ${statusMessage}`);
-    }
+### Parts & Inventory
 
-    return result;
-  }
+- `GET /api/parts` - Search parts
+- `GET /api/parts/inventory` - Get part inventory
+- `GET /api/parts/:id/best-cost` - Get best cost for a part
+- `POST /api/parts/:id/inventory/add` - Add inventory for a part
+- `POST /api/parts/:id/inventory/cycle` - Cycle inventory
+- `POST /api/parts/:id/inventory/scrap` - Scrap inventory
 
-  async getParts() {
-    await this.ensureAuthenticated();
+### Purchase Orders
 
-    const partsRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          PartGetRq: {
-            GetAll: true
-          }
-        }
-      }
-    };
+- `GET /api/purchase-orders` - List purchase orders
+- `GET /api/purchase-orders/:id` - Get purchase order by ID
+- `POST /api/purchase-orders` - Create purchase order
+- `POST /api/purchase-orders/:id` - Update purchase order
+- `POST /api/purchase-orders/:id/issue` - Issue purchase order
+- `POST /api/purchase-orders/:id/unissue` - Unissue purchase order
+- `POST /api/purchase-orders/:id/close-short` - Close purchase order short
+- `POST /api/purchase-orders/:id/void` - Void purchase order
+- `DELETE /api/purchase-orders/:id` - Delete purchase order
 
-    const requestXml = xmlBuilder.buildObject(partsRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
+### Manufacture Orders
 
-    // Check for errors
-    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
-        result.FbiXml.FbiMsgsRs[0].PartGetRs && 
-        result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusCode &&
-        result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusCode[0] !== '1000') {
-      
-      const statusMessage = result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusMessage ?
-                            result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusMessage[0] : 'Unknown error';
-      
-      throw new Error(`Failed to get parts: ${statusMessage}`);
-    }
+- `GET /api/manufacture-orders` - List manufacture orders
+- `GET /api/manufacture-orders/:id` - Get manufacture order by ID
+- `POST /api/manufacture-orders` - Create manufacture order
+- `POST /api/manufacture-orders/:id/issue` - Issue manufacture order
+- `POST /api/manufacture-orders/:id/unissue` - Unissue manufacture order
+- `POST /api/manufacture-orders/:id/close-short` - Close manufacture order short
+- `DELETE /api/manufacture-orders/:id` - Delete manufacture order
 
-    return result;
-  }
+### Memos
 
-  async logout() {
-    if (!this.sessionToken) {
-      return { success: true, message: 'Not logged in' };
-    }
+- `GET /api/{type}/:id/memos` - Get memos for a PO or MO
+- `GET /api/{type}/:id/memos/:memoId` - Get specific memo
+- `POST /api/{type}/:id/memos` - Create memo
+- `POST /api/{type}/:id/memos/:memoId` - Update memo
+- `DELETE /api/{type}/:id/memos/:memoId` - Delete memo
 
-    const logoutRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          LogoutRq: {}
-        }
-      }
-    };
+Where `{type}` can be `purchase-orders` or `manufacture-orders`
 
-    try {
-      const requestXml = xmlBuilder.buildObject(logoutRequest);
-      const response = await this.sendRequest(requestXml);
-      const result = await xmlParser.parseStringPromise(response);
+### Other Endpoints
 
-      // Reset session data
-      this.sessionToken = null;
-      this.userId = null;
+- `GET /api/products/:id/best-price` - Get best price for a product
+- `GET /api/uoms` - List units of measure
+- `GET /api/vendors` - List vendors
+- `GET /api/users` - List users
+- `GET /api/health` - Check server health and authentication status
 
-      return { success: true, message: 'Successfully logged out' };
-    } catch (error) {
-      console.error('Logout error:', error.message);
-      // Reset session data even if the logout request fails
-      this.sessionToken = null;
-      this.userId = null;
-      return { success: false, error: error.message };
-    }
-  }
+## Security Considerations
 
-  disconnect() {
-    if (this.client) {
-      // Attempt to logout if we have a session
-      if (this.sessionToken) {
-        this.logout().catch(console.error);
-      }
-      
-      this.client.destroy();
-      this.client = null;
-      this.sessionToken = null;
-      this.userId = null;
-      console.log('Disconnected from Fishbowl server');
-    }
-  }
-}
+- Store your Fishbowl credentials securely using environment variables
+- Use HTTPS in production to encrypt data in transit
+- The server handles authentication tokens automatically, but be aware that they expire
+- Consider implementing additional authentication for your MCP server in production
 
-// Create Fishbowl client instance
-const fishbowl = new FishbowlClient();
+## Troubleshooting
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'healthy',
-    version: '1.0.0',
-    timestamp: new Date().toISOString()
-  });
-});
+### Common Issues
 
-// MCP endpoint to execute commands
-app.post('/mcp/execute', async (req, res) => {
-  try {
-    const { command, parameters } = req.body;
-    
-    let result;
-    switch (command) {
-      case 'getInventory':
-        if (!parameters || !parameters.partNumber) {
-          throw new Error('Part number is required');
-        }
-        result = await fishbowl.getInventory(parameters.partNumber);
-        break;
-      
-      case 'getProducts':
-        result = await fishbowl.getProducts();
-        break;
-      
-      case 'getParts':
-        result = await fishbowl.getParts();
-        break;
-      
-      case 'login':
-        result = await fishbowl.login();
-        break;
-      
-      case 'logout':
-        result = await fishbowl.logout();
-        break;
-      
-      default:
-        throw new Error(`Unknown command: ${command}`);
-    }
-    
-    res.json({
-      success: true,
-      result: result,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error executing command:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+1. **Authentication failures:**
+   - Verify your Fishbowl credentials in the .env file
+   - Ensure the Fishbowl API is enabled and accessible
+   - Check if your Fishbowl user has appropriate permissions
 
-// Additional specific endpoints for easier access
-app.get('/mcp/inventory/:partNumber', async (req, res) => {
-  try {
-    const result = await fishbowl.getInventory(req.params.partNumber);
-    res.json({
-      success: true,
-      data: result,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error getting inventory:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+2. **Connection errors:**
+   - Verify the FISHBOWL_API_URL is correct
+   - Ensure your Fishbowl server is running and accessible from the MCP server
+   - Check for any firewalls or network restrictions
 
-app.get('/mcp/products', async (req, res) => {
-  try {
-    const result = await fishbowl.getProducts();
-    res.json({
-      success: true,
-      data: result,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error getting products:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+3. **Deployment issues on Railway:**
+   - Verify all environment variables are set correctly
+   - Check the logs for any errors: `railway logs`
+   - Ensure your Railway project has sufficient resources
 
-app.get('/mcp/parts', async (req, res) => {
-  try {
-    const result = await fishbowl.getParts();
-    res.json({
-      success: true,
-      data: result,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error getting parts:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+## Contributing
 
-// Status endpoint
-app.get('/status', async (req, res) => {
-  try {
-    // Try to login to check if Fishbowl is accessible
-    await fishbowl.login();
-    await fishbowl.logout();
-    
-    res.json({
-      status: 'connected',
-      fishbowlHost: fishbowl.host,
-      fishbowlPort: fishbowl.port
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: 'disconnected',
-      error: error.message,
-      fishbowlHost: fishbowl.host,
-      fishbowlPort: fishbowl.port
-    });
-  }
-});
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  fishbowl.disconnect();
-  process.exit(0);
-});
+## License
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  fishbowl.disconnect();
-  process.exit(0);
-});
-
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`MCP Fishbowl Server running on port ${PORT}`);
-  console.log(`Configured to connect to Fishbowl at ${fishbowl.host}:${fishbowl.port}`);
-});
+This project is licensed under the ISC License.
