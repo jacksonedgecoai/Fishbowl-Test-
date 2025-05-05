@@ -926,4 +926,11 @@ const server = app.listen(PORT, () => {
 // Handle server errors
 server.on('error', (error) => {
   console.error('Server error:', error);
-  if (error.code === 'EADDRIN
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Please choose a different port.`);
+    process.exit(1);
+  }
+});
+
+// Export for testing purposes
+module.exports = app;
