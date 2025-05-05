@@ -84,7 +84,7 @@ const TOKEN_REFRESH_THRESHOLD = 10 * 60 * 1000; // 10 minutes before expiration
 // Set default axios timeout
 axios.defaults.timeout = 30000; // 30 seconds
 
-// Error response helper
+// Error response helper - Fixed missing parenthesis
 const sendErrorResponse = (res, error) => {
   console.error(`Error: ${error.message}`, error.stack);
   const status = error.response?.status || 500;
@@ -845,4 +845,85 @@ app.get('/api/vendors', ensureAuthenticated, async (req, res) => {
     
     res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error
+    sendErrorResponse(res, error);
+  }
+});
+
+// User Endpoints
+
+// Get users
+app.get('/api/users', ensureAuthenticated, async (req, res) => {
+  try {
+    const data = await makeRequest('get', '/api/users', { 
+      params: req.query 
+    });
+    
+    res.json(data);
+  } catch (error) {
+    sendErrorResponse(res, error);
+  }
+});
+
+// Add error handling middleware
+app.use(errorHandler);
+
+// 404 handler
+app.use((req, res, next) => {
+  res.status(404).json({ 
+    error: 'Not Found', 
+    message: `Route ${req.method} ${req.url} not found` 
+  });
+});
+
+// Process uncaught exceptions and unhandled rejections
+process.on('uncaughtException', (error) => {
+  console.error('UNCAUGHT EXCEPTION:', error);
+  console.error('Stack trace:', error.stack);
+  // Keep the process alive but log the error
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION at:', promise);
+  console.error('Reason:', reason);
+  // Keep the process alive but log the error
+});
+
+// Create a graceful shutdown function
+const gracefulShutdown = () => {
+  console.log('Shutting down gracefully...');
+  
+  // Attempt to logout if we have a token
+  if (fishbowlToken) {
+    axios.post(`${FISHBOWL_API_URL}/api/logout`, {}, {
+      headers: {
+        'Authorization': `Bearer ${fishbowlToken}`,
+        'Content-Type': 'application/json'
+      }
+    }).catch(() => {
+      console.log('Logout failed during shutdown, but continuing shutdown process');
+    });
+  }
+  
+  // Exit the process
+  process.exit(0);
+};
+
+// Listen for termination signals
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+// Start server and handle errors
+const server = app.listen(PORT, () => {
+  console.log(`MCP Server listening on port ${PORT}`);
+  
+  // Try to login on startup
+  login().catch(err => {
+    console.error('Initial login failed:', err.message);
+    console.log('Server will attempt to login again when handling requests');
+  });
+});
+
+// Handle server errors
+server.on('error', (error) => {
+  console.error('Server error:', error);
+  if (error.code === 'EADDRIN
