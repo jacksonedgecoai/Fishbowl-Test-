@@ -1,7 +1,7 @@
 {
   "name": "mcp-fishbowl-server",
   "version": "1.0.0",
-  "description": "MCP Server for Fishbowl Inventory Integration",
+  "description": "MCP Server for Fishbowl Inventory Data Access",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,7 +10,7 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "axios": "^1.6.0",
+    "net": "^1.0.2",
     "xml2js": "^0.6.2"
   },
   "engines": {
