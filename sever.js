@@ -4,6 +4,7 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 require('dotenv').config();
+const { errorHandler, ApiError } = require('./errorHandler');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -644,6 +645,14 @@ app.get('/api/users', ensureAuthenticated, async (req, res) => {
     console.error('Error fetching users:', error.message);
     res.status(500).json({ error: 'Failed to fetch users' });
   }
+});
+
+// Add error handling middleware
+app.use(errorHandler);
+
+// 404 handler
+app.use((req, res, next) => {
+  res.status(404).json({ error: 'Not Found', message: `Route ${req.method} ${req.url} not found` });
 });
 
 // Start the server
