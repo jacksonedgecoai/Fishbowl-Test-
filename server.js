@@ -207,12 +207,12 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-// Set up rate limiting
-const apiLimiter = rateLimit({
+// Set up rate limiting - remove any let declaration since we already declared it at the top
+const apiLimiter = rateLimit ? rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later'
-});
+}) : (req, res, next) => next(); // Fallback if rateLimit is not available
 
 // Apply rate limiting to all requests
 app.use('/api/', apiLimiter);
