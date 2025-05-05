@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const net = require('net');
-const xml2js = require('xml2js');
+const axios = require('axios'); // For making HTTP requests
 require('dotenv').config();
 
 const app = express();
@@ -11,177 +10,203 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// XML parser and builder
-const xmlParser = new xml2js.Parser();
-const xmlBuilder = new xml2js.Builder();
-
-// Fishbowl API Client
+// Fishbowl REST API Client
 class FishbowlClient {
   constructor() {
-    this.host = process.env.FISHBOWL_HOST || 'localhost';
-    this.port = parseInt(process.env.FISHBOWL_PORT) || 28192;
-    this.username = process.env.FISHBOWL_USERNAME;
-    this.password = process.env.FISHBOWL_PASSWORD;
-    this.sessionToken = null;
-    this.userId = null;
-  }
-
-  async connect() {
-    return new Promise((resolve, reject) => {
-      this.client = new net.Socket();
-      this.client.connect(this.port, this.host, () => {
-        console.log('Connected to Fishbowl server');
-        resolve();
-      });
-
-      this.client.on('error', (error) => {
-        console.error('Connection error:', error);
-        reject(error);
-      });
-    });
-  }
-
-  async sendRequest(requestXml) {
-    return new Promise((resolve, reject) => {
-      if (!this.client) {
-        reject(new Error('Not connected to Fishbowl server'));
-        return;
-      }
-
-      let responseData = '';
-      
-      this.client.on('data', (data) => {
-        responseData += data.toString();
-        // Check if we have received the complete response
-        if (responseData.includes('</FbiXml>')) {
-          this.client.removeAllListeners('data');
-          resolve(responseData);
-        }
-      });
-
-      this.client.on('error', (error) => {
-        reject(error);
-      });
-
-      // Send the request
-      this.client.write(requestXml);
-    });
+    this.baseUrl = process.env.FISHBOWL_API_URL || 'http://localhost:80';
+    this.username = process.env.FISHBOWL_USERNAME || 'admin';
+    this.password = process.env.FISHBOWL_PASSWORD || 'admin';
+    this.appName = process.env.FISHBOWL_APP_NAME || 'MCP Fishbowl Server';
+    this.appId = process.env.FISHBOWL_APP_ID || '101';
+    this.token = null;
   }
 
   async login() {
-    if (!this.client) {
-      await this.connect();
-    }
-
-    const loginRequest = {
-      FbiXml: {
-        $: { version: '1.0' },
-        Ticket: {},
-        FbiMsgsRq: {
-          LoginRq: {
-            IAID: process.env.FISHBOWL_IAID || '54321',
-            IAName: 'MCP Fishbowl Server',
-            IADescription: 'MCP Server for Fishbowl Integration',
-            UserName: this.username,
-            UserPassword: this.password
-          }
+    try {
+      const response = await axios.post(`${this.baseUrl}/api/login`, {
+        appName: this.appName,
+        appId: this.appId,
+        username: this.username,
+        password: this.password
+      }, {
+        headers: {
+          'Content-Type': 'application/json'
         }
+      });
+
+      if (response.data && response.data.token) {
+        this.token = response.data.token;
+        console.log('Successfully logged in to Fishbowl API');
+        return { success: true, token: this.token };
+      } else {
+        throw new Error('Login failed: No token received');
       }
-    };
-
-    const requestXml = xmlBuilder.buildObject(loginRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
-
-    if (result.FbiXml && result.FbiXml.Ticket && result.FbiXml.Ticket[0]) {
-      this.sessionToken = result.FbiXml.Ticket[0].Key[0];
-      this.userId = result.FbiXml.Ticket[0].UserID[0];
-      return { success: true, token: this.sessionToken };
-    } else {
-      throw new Error('Login failed');
+    } catch (error) {
+      console.error('Login error:', error.message);
+      throw new Error(`Login failed: ${error.message}`);
     }
+  }
+
+  async ensureAuthenticated() {
+    if (!this.token) {
+      await this.login();
+    }
+    return this.token;
+  }
+
+  getAuthHeaders() {
+    return {
+      'Authorization': `Bearer ${this.token}`,
+      'Content-Type': 'application/json'
+    };
   }
 
   async getInventory(partNumber) {
-    if (!this.sessionToken) {
-      await this.login();
+    await this.ensureAuthenticated();
+    
+    try {
+      const response = await axios.get(
+        `${this.baseUrl}/api/parts/inventory?number=${encodeURIComponent(partNumber)}`,
+        { headers: this.getAuthHeaders() }
+      );
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error getting inventory:', error.message);
+      throw new Error(`Failed to get inventory: ${error.message}`);
     }
-
-    const inventoryRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          InventoryQtyRq: {
-            PartNum: partNumber
-          }
-        }
-      }
-    };
-
-    const requestXml = xmlBuilder.buildObject(inventoryRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
-
-    return result;
   }
 
-  async getProducts() {
-    if (!this.sessionToken) {
-      await this.login();
-    }
-
-    const productsRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          ProductQueryRq: {
-            GetAll: true
-          }
+  async getParts(options = {}) {
+    await this.ensureAuthenticated();
+    
+    try {
+      // Build query parameters from options
+      const queryParams = new URLSearchParams();
+      Object.entries(options).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          queryParams.append(key, value);
         }
-      }
-    };
-
-    const requestXml = xmlBuilder.buildObject(productsRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
-
-    return result;
+      });
+      
+      const url = `${this.baseUrl}/api/parts/?${queryParams.toString()}`;
+      const response = await axios.get(url, { headers: this.getAuthHeaders() });
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error getting parts:', error.message);
+      throw new Error(`Failed to get parts: ${error.message}`);
+    }
   }
 
-  async getParts() {
-    if (!this.sessionToken) {
-      await this.login();
-    }
-
-    const partsRequest = {
-      FbiXml: {
-        Ticket: {
-          Key: this.sessionToken
-        },
-        FbiMsgsRq: {
-          PartQueryRq: {
-            GetAll: true
-          }
+  async getProducts(options = {}) {
+    await this.ensureAuthenticated();
+    
+    try {
+      // Products endpoint isn't directly shown in the collection
+      // Assuming a similar structure to parts endpoint
+      const queryParams = new URLSearchParams();
+      Object.entries(options).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          queryParams.append(key, value);
         }
-      }
-    };
-
-    const requestXml = xmlBuilder.buildObject(partsRequest);
-    const response = await this.sendRequest(requestXml);
-    const result = await xmlParser.parseStringPromise(response);
-
-    return result;
+      });
+      
+      const url = `${this.baseUrl}/api/products/?${queryParams.toString()}`;
+      const response = await axios.get(url, { headers: this.getAuthHeaders() });
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error getting products:', error.message);
+      throw new Error(`Failed to get products: ${error.message}`);
+    }
   }
 
-  disconnect() {
-    if (this.client) {
-      this.client.destroy();
-      this.client = null;
-      this.sessionToken = null;
+  async getManufactureOrders(options = {}) {
+    await this.ensureAuthenticated();
+    
+    try {
+      const queryParams = new URLSearchParams();
+      Object.entries(options).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          queryParams.append(key, value);
+        }
+      });
+      
+      const url = `${this.baseUrl}/api/manufacture-orders?${queryParams.toString()}`;
+      const response = await axios.get(url, { headers: this.getAuthHeaders() });
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error getting manufacture orders:', error.message);
+      throw new Error(`Failed to get manufacture orders: ${error.message}`);
+    }
+  }
+
+  async getPurchaseOrders(options = {}) {
+    await this.ensureAuthenticated();
+    
+    try {
+      const queryParams = new URLSearchParams();
+      Object.entries(options).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) {
+          queryParams.append(key, value);
+        }
+      });
+      
+      const url = `${this.baseUrl}/api/purchase-orders?${queryParams.toString()}`;
+      const response = await axios.get(url, { headers: this.getAuthHeaders() });
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error getting purchase orders:', error.message);
+      throw new Error(`Failed to get purchase orders: ${error.message}`);
+    }
+  }
+
+  async addInventory(partId, data) {
+    await this.ensureAuthenticated();
+    
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/api/parts/${partId}/inventory/add`,
+        data,
+        { headers: this.getAuthHeaders() }
+      );
+      
+      return response.data;
+    } catch (error) {
+      console.error('Error adding inventory:', error.message);
+      throw new Error(`Failed to add inventory: ${error.message}`);
+    }
+  }
+
+  async logout() {
+    if (!this.token) {
+      return { success: true, message: 'Already logged out' };
+    }
+    
+    try {
+      await axios.post(
+        `${this.baseUrl}/api/logout`,
+        {
+          appName: this.appName,
+          appDescription: "MCP Fishbowl Integration",
+          appId: this.appId,
+          username: this.username,
+          password: this.password,
+          passwordEncrypted: "false"
+        },
+        { 
+          headers: this.getAuthHeaders() 
+        }
+      );
+      
+      this.token = null;
+      return { success: true, message: 'Successfully logged out' };
+    } catch (error) {
+      console.error('Logout error:', error.message);
+      throw new Error(`Logout failed: ${error.message}`);
     }
   }
 }
@@ -194,7 +219,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy' });
 });
 
-// MCP endpoint to get inventory for a specific part
+// MCP endpoint for execute commands
 app.post('/mcp/execute', async (req, res) => {
   try {
     const { command, parameters } = req.body;
@@ -206,15 +231,31 @@ app.post('/mcp/execute', async (req, res) => {
         break;
       
       case 'getProducts':
-        result = await fishbowl.getProducts();
+        result = await fishbowl.getProducts(parameters);
         break;
       
       case 'getParts':
-        result = await fishbowl.getParts();
+        result = await fishbowl.getParts(parameters);
+        break;
+      
+      case 'getManufactureOrders':
+        result = await fishbowl.getManufactureOrders(parameters);
+        break;
+        
+      case 'getPurchaseOrders':
+        result = await fishbowl.getPurchaseOrders(parameters);
+        break;
+        
+      case 'addInventory':
+        result = await fishbowl.addInventory(parameters.partId, parameters.data);
         break;
       
       case 'login':
         result = await fishbowl.login();
+        break;
+        
+      case 'logout':
+        result = await fishbowl.logout();
         break;
       
       default:
@@ -235,7 +276,7 @@ app.post('/mcp/execute', async (req, res) => {
   }
 });
 
-// Additional specific endpoints for easier access
+// Specific endpoints for easier access
 app.get('/mcp/inventory/:partNumber', async (req, res) => {
   try {
     const result = await fishbowl.getInventory(req.params.partNumber);
@@ -253,7 +294,7 @@ app.get('/mcp/inventory/:partNumber', async (req, res) => {
 
 app.get('/mcp/products', async (req, res) => {
   try {
-    const result = await fishbowl.getProducts();
+    const result = await fishbowl.getProducts(req.query);
     res.json({
       success: true,
       data: result
@@ -268,7 +309,37 @@ app.get('/mcp/products', async (req, res) => {
 
 app.get('/mcp/parts', async (req, res) => {
   try {
-    const result = await fishbowl.getParts();
+    const result = await fishbowl.getParts(req.query);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/mcp/manufacture-orders', async (req, res) => {
+  try {
+    const result = await fishbowl.getManufactureOrders(req.query);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/mcp/purchase-orders', async (req, res) => {
+  try {
+    const result = await fishbowl.getPurchaseOrders(req.query);
     res.json({
       success: true,
       data: result
@@ -284,7 +355,7 @@ app.get('/mcp/parts', async (req, res) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received. Shutting down gracefully...');
-  fishbowl.disconnect();
+  fishbowl.logout().catch(console.error);
   process.exit(0);
 });
 
