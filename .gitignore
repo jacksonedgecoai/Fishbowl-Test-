@@ -1,4 +1,27 @@
+# Dependency directories
 node_modules/
+npm-debug.log
+
+# Environment variables
 .env
+
+# Logs
+logs
 *.log
+
+# OS specific files
 .DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Railway specific
+.railway/
+
+# Build outputs
+dist/
+build/
