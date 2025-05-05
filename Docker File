@@ -29,3 +29,6 @@ EXPOSE 3000
 
 # Try the original server first, fall back to backup if it fails
 CMD sh -c 'if [ -f "server.js" ]; then node server.js; else node backup-server.js; fi'
+
+# Add this line before the CMD line in your Dockerfile
+RUN echo 'const express = require("express"); const app = express(); app.get("/", (req, res) => res.send("Hello")); app.listen(process.env.PORT || 3000);' > server.js
