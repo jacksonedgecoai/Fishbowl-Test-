@@ -25,33 +25,26 @@ const isValidString = (str) => {
 const isValidNumber = (num) => {
   const parsed = parseFloat(num);
   return !isNaN(parsed);
-};// Now require the error handler module (it will exist from previous code block)
-let errorHandlerModule;
-try {
-  errorHandlerModule = require('./errorHandler');
-} catch (error) {
-  console.error('Failed to load errorHandler.js module even after creating it:', error.message);
-  // Define minimal error handling in case require still fails
-  errorHandlerModule = {
-    ApiError: class ApiError extends Error {
-      constructor(status, message) {
-        super(message);
-        this.status = status;
-      }
-    },
-    errorHandler: (err, req, res, next) => {
-      console.error('Error occurred:', err);
-      const status = err.status || 500;
-      const message = err.message || 'An unexpected error occurred';
-      res.status(status).json({ error: message });
-    }
-  };
-}
-
-const { errorHandler, ApiError } = errorHandlerModule;// server.js - Main server file for Fishbowl MCP Server
+};// We've already loaded the error handler module in the previous block
+// ApiError and errorHandler are already defined
+// No need to require it again// server.js - Main server file for Fishbowl MCP Server
 
 // Check for required dependencies and handle missing modules gracefully
-let express, axios, cors, dotenv, errorHandlerModule;
+let express, axios, cors, dotenv, errorHandlerModule, errorHandler, ApiError, fs, path;
+
+try {
+  fs = require('fs');
+} catch (error) {
+  console.error('Failed to load fs module:', error.message);
+  process.exit(1);
+}
+
+try {
+  path = require('path');
+} catch (error) {
+  console.error('Failed to load path module:', error.message);
+  process.exit(1);
+}
 
 try {
   express = require('express');
@@ -120,13 +113,34 @@ try {
 const { body, param, query, validationResult } = validator;
 
 // Create a simple error handler file if it doesn't exist
-const fs = require('fs');
-const path = require('path');
-
 const errorHandlerPath = path.join(__dirname, 'errorHandler.js');
 try {
   fs.accessSync(errorHandlerPath, fs.constants.F_OK);
   console.log('Found errorHandler.js file');
+  
+  // Now try to load the module
+  try {
+    const loadedModule = require('./errorHandler');
+    errorHandler = loadedModule.errorHandler;
+    ApiError = loadedModule.ApiError;
+    console.log('Successfully loaded errorHandler module');
+  } catch (loadError) {
+    console.error('Failed to load errorHandler.js module:', loadError.message);
+    // Define fallback error handlers
+    ApiError = class ApiError extends Error {
+      constructor(status, message) {
+        super(message);
+        this.status = status;
+      }
+    };
+    
+    errorHandler = (err, req, res, next) => {
+      console.error('Error occurred:', err);
+      const status = err.status || 500;
+      const message = err.message || 'An unexpected error occurred';
+      res.status(status).json({ error: message });
+    };
+  }
 } catch (error) {
   console.warn('errorHandler.js not found, creating a basic version...');
   
@@ -151,8 +165,38 @@ module.exports = { ApiError, errorHandler };
   try {
     fs.writeFileSync(errorHandlerPath, basicErrorHandler);
     console.log('Created basic errorHandler.js file');
+    
+    // Define our fallback error handlers
+    ApiError = class ApiError extends Error {
+      constructor(status, message) {
+        super(message);
+        this.status = status;
+      }
+    };
+    
+    errorHandler = (err, req, res, next) => {
+      console.error('Error occurred:', err);
+      const status = err.status || 500;
+      const message = err.message || 'An unexpected error occurred';
+      res.status(status).json({ error: message });
+    };
   } catch (writeError) {
     console.error('Failed to create errorHandler.js:', writeError.message);
+    
+    // Still define our fallback error handlers
+    ApiError = class ApiError extends Error {
+      constructor(status, message) {
+        super(message);
+        this.status = status;
+      }
+    };
+    
+    errorHandler = (err, req, res, next) => {
+      console.error('Error occurred:', err);
+      const status = err.status || 500;
+      const message = err.message || 'An unexpected error occurred';
+      res.status(status).json({ error: message });
+    };
   }
 }
 
