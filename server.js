@@ -1,10 +1,85 @@
 // server.js - Main server file for Fishbowl MCP Server
 
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-require('dotenv').config();
-const { errorHandler, ApiError } = require('./errorHandler');
+// Check for required dependencies and handle missing modules gracefully
+let express, axios, cors, dotenv, errorHandlerModule;
+
+try {
+  express = require('express');
+} catch (error) {
+  console.error('Failed to load express module:', error.message);
+  process.exit(1);
+}
+
+try {
+  axios = require('axios');
+} catch (error) {
+  console.error('Failed to load axios module:', error.message);
+  process.exit(1);
+}
+
+try {
+  cors = require('cors');
+} catch (error) {
+  console.error('Failed to load cors module:', error.message);
+  process.exit(1);
+}
+
+try {
+  dotenv = require('dotenv');
+  dotenv.config();
+} catch (error) {
+  console.error('Failed to load dotenv module:', error.message);
+  console.warn('Continuing without environment variable loading. Default values will be used.');
+}
+
+// Optional dependencies with fallbacks
+let rateLimit;
+try {
+  rateLimit = require('express-rate-limit');
+} catch (error) {
+  console.warn('express-rate-limit module not found. Rate limiting will be disabled.');
+  // Provide a no-op middleware as fallback
+  rateLimit = () => (req, res, next) => next();
+}
+
+let validator;
+try {
+  validator = require('express-validator');
+} catch (error) {
+  console.warn('express-validator module not found. Input validation will be minimal.');
+  // Provide minimal validation functions as fallbacks
+  validator = {
+    body: () => (req, res, next) => next(),
+    param: () => (req, res, next) => next(),
+    query: () => (req, res, next) => next(),
+    validationResult: req => ({ isEmpty: () => true, array: () => [] })
+  };
+}
+const { body, param, query, validationResult } = validator;
+
+// Custom error handler with fallback
+let errorHandler, ApiError;
+try {
+  errorHandlerModule = require('./errorHandler');
+  errorHandler = errorHandlerModule.errorHandler;
+  ApiError = errorHandlerModule.ApiError;
+} catch (error) {
+  console.warn('Error handler module not found. Using built-in error handler.');
+  // Fallback error handler
+  ApiError = class ApiError extends Error {
+    constructor(status, message) {
+      super(message);
+      this.status = status;
+    }
+  };
+  
+  errorHandler = (err, req, res, next) => {
+    console.error(err);
+    const status = err.status || 500;
+    const message = err.message || 'An unexpected error occurred';
+    res.status(status).json({ error: message });
+  };
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,51 +88,169 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-// Authentication token storage
+// Set up rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later'
+});
+
+// Apply rate limiting to all requests
+app.use('/api/', apiLimiter);
+
+// Authentication token storage and expiration
 let fishbowlToken = null;
+let tokenExpiration = null;
+const TOKEN_REFRESH_THRESHOLD = 10 * 60 * 1000; // 10 minutes before expiration
 
 // Fishbowl API base URL
 const FISHBOWL_API_URL = process.env.FISHBOWL_API_URL || 'http://localhost:80';
 
+// Configure Axios defaults for timeouts
+axios.defaults.timeout = 30000; // 30 seconds timeout
+
+// Error response helper
+const sendErrorResponse = (res, error) => {
+  console.error(`Error: ${error.message}`, error.stack);
+  const status = error.response?.status || 500;
+  const errorMessage = error.response?.data?.error || error.message || 'An unexpected error occurred';
+  res.status(status).json({ error: errorMessage });
+};
+
+// Input validation middleware
+const validateRequest = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  next();
+};
+
 // Login middleware to ensure we have a valid token
 const ensureAuthenticated = async (req, res, next) => {
-  if (!fishbowlToken) {
-    try {
+  try {
+    // Check if token is missing or close to expiration
+    const now = Date.now();
+    if (!fishbowlToken || (tokenExpiration && now > tokenExpiration - TOKEN_REFRESH_THRESHOLD)) {
       await login();
-      next();
-    } catch (error) {
-      console.error('Authentication failed:', error.message);
-      return res.status(401).json({ error: 'Authentication with Fishbowl failed' });
     }
-  } else {
     next();
+  } catch (error) {
+    console.error('Authentication failed:', error.message);
+    return res.status(401).json({ error: 'Authentication with Fishbowl failed' });
   }
 };
 
 // Login to Fishbowl API
 const login = async () => {
   try {
+    // Check if required credentials are set
+    if (!process.env.FISHBOWL_USERNAME || !process.env.FISHBOWL_PASSWORD) {
+      console.error('Missing required environment variables: FISHBOWL_USERNAME and/or FISHBOWL_PASSWORD');
+      throw new Error('Missing Fishbowl credentials. Please check your .env file.');
+    }
+    
+    const appName = process.env.FISHBOWL_APP_NAME || "MCP Server";
+    let appId;
+    
+    try {
+      appId = parseInt(process.env.FISHBOWL_APP_ID || "101");
+      if (isNaN(appId)) {
+        throw new Error('Invalid appId');
+      }
+    } catch (parseError) {
+      console.error('Invalid FISHBOWL_APP_ID:', process.env.FISHBOWL_APP_ID);
+      appId = 101; // Default value
+    }
+    
+    // Attempt login with timeout
     const response = await axios.post(`${FISHBOWL_API_URL}/api/login`, {
-      appName: process.env.FISHBOWL_APP_NAME || "MCP Server",
-      appId: parseInt(process.env.FISHBOWL_APP_ID || "101"),
+      appName: appName,
+      appId: appId,
       username: process.env.FISHBOWL_USERNAME,
       password: process.env.FISHBOWL_PASSWORD
     }, {
       headers: {
         'Content-Type': 'application/json'
-      }
+      },
+      timeout: 10000 // 10 second timeout specifically for login
     });
 
     if (response.data && response.data.token) {
       fishbowlToken = response.data.token;
+      
+      // Set token expiration time (assuming token is valid for 24 hours)
+      // Adjust this based on actual Fishbowl API token lifetime
+      tokenExpiration = Date.now() + (24 * 60 * 60 * 1000);
+      
       console.log('Successfully authenticated with Fishbowl');
       return true;
     } else {
       console.error('No token received from Fishbowl API');
-      return false;
+      throw new Error('Authentication failed - no token received');
     }
   } catch (error) {
-    console.error('Login error:', error.message);
+    // More detailed error logging
+    if (error.response) {
+      // The request was made and the server responded with a status code outside of 2xx
+      console.error('Login failed with status:', error.response.status);
+      console.error('Response data:', error.response.data);
+    } else if (error.request) {
+      // The request was made but no response was received
+      console.error('No response received from Fishbowl API');
+      console.error('Request:', error.request);
+      
+      // Add connectivity check
+      try {
+        await axios.get(`${FISHBOWL_API_URL}/api/health`, { timeout: 5000 });
+        console.error('Fishbowl API is reachable but login failed');
+      } catch (connectError) {
+        console.error('Cannot connect to Fishbowl API:', connectError.message);
+      }
+    } else {
+      // Something happened in setting up the request that triggered an error
+      console.error('Login error:', error.message);
+    }
+    
+    throw error;
+  }
+};
+
+// Request wrapper with error handling
+const makeRequest = async (method, url, options = {}) => {
+  try {
+    const response = await axios({
+      method,
+      url: `${FISHBOWL_API_URL}${url}`,
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${fishbowlToken}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+    return response.data;
+  } catch (error) {
+    // Check if error is due to token expiration
+    if (error.response && error.response.status === 401) {
+      // Try to refresh token and retry the request once
+      try {
+        await login();
+        const retryResponse = await axios({
+          method,
+          url: `${FISHBOWL_API_URL}${url}`,
+          ...options,
+          headers: {
+            'Authorization': `Bearer ${fishbowlToken}`,
+            'Content-Type': 'application/json',
+            ...(options.headers || {})
+          }
+        });
+        return retryResponse.data;
+      } catch (retryError) {
+        throw retryError;
+      }
+    }
     throw error;
   }
 };
@@ -66,7 +259,15 @@ const login = async () => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', authenticated: !!fishbowlToken });
+  const tokenStatus = fishbowlToken ? 'valid' : 'not authenticated';
+  const tokenExpiresIn = tokenExpiration ? Math.max(0, Math.floor((tokenExpiration - Date.now()) / 1000)) : 'unknown';
+  
+  res.json({ 
+    status: 'ok', 
+    authenticated: !!fishbowlToken,
+    tokenStatus,
+    tokenExpiresIn: tokenExpiration ? `${tokenExpiresIn} seconds` : 'unknown'
+  });
 });
 
 // Login endpoint
@@ -75,389 +276,349 @@ app.post('/api/login', async (req, res) => {
     await login();
     res.json({ success: true });
   } catch (error) {
-    res.status(401).json({ error: 'Authentication failed' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Logout endpoint
 app.post('/api/logout', ensureAuthenticated, async (req, res) => {
   try {
-    await axios.post(`${FISHBOWL_API_URL}/api/logout`, {}, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    await makeRequest('post', '/api/logout', { data: {} });
     
     fishbowlToken = null;
+    tokenExpiration = null;
     res.json({ success: true });
   } catch (error) {
-    console.error('Logout error:', error.message);
-    res.status(500).json({ error: 'Failed to logout' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Parts Endpoints
 
 // Get parts inventory
-app.get('/api/parts/inventory', ensureAuthenticated, async (req, res) => {
+app.get('/api/parts/inventory', [
+  query('number').optional().isString(),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const partNumber = req.query.number;
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/parts/inventory`, {
-      params: { number: partNumber },
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/parts/inventory', { 
+      params: { number: partNumber } 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching part inventory:', error.message);
-    res.status(500).json({ error: 'Failed to fetch part inventory' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Get parts
-app.get('/api/parts', ensureAuthenticated, async (req, res) => {
+app.get('/api/parts', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/parts/`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/parts/', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching parts:', error.message);
-    res.status(500).json({ error: 'Failed to fetch parts' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Get part best cost
-app.get('/api/parts/:id/best-cost', ensureAuthenticated, async (req, res) => {
+app.get('/api/parts/:id/best-cost', [
+  param('id').isInt().withMessage('Part ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const partId = req.params.id;
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/parts/${partId}/best-cost`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', `/api/parts/${partId}/best-cost`, { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching part best cost:', error.message);
-    res.status(500).json({ error: 'Failed to fetch part best cost' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Add inventory
-app.post('/api/parts/:id/inventory/add', ensureAuthenticated, async (req, res) => {
+app.post('/api/parts/:id/inventory/add', [
+  param('id').isInt().withMessage('Part ID must be an integer'),
+  body('quantity').isFloat().withMessage('Quantity must be a number'),
+  body('locationId').isInt().withMessage('Location ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const partId = req.params.id;
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/parts/${partId}/inventory/add`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', `/api/parts/${partId}/inventory/add`, { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error adding inventory:', error.message);
-    res.status(500).json({ error: 'Failed to add inventory' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Cycle inventory
-app.post('/api/parts/:id/inventory/cycle', ensureAuthenticated, async (req, res) => {
+app.post('/api/parts/:id/inventory/cycle', [
+  param('id').isInt().withMessage('Part ID must be an integer'),
+  body('quantity').isFloat().withMessage('Quantity must be a number'),
+  body('locationId').isInt().withMessage('Location ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const partId = req.params.id;
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/parts/${partId}/inventory/cycle`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', `/api/parts/${partId}/inventory/cycle`, { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error cycling inventory:', error.message);
-    res.status(500).json({ error: 'Failed to cycle inventory' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Scrap inventory
-app.post('/api/parts/:id/inventory/scrap', ensureAuthenticated, async (req, res) => {
+app.post('/api/parts/:id/inventory/scrap', [
+  param('id').isInt().withMessage('Part ID must be an integer'),
+  body('quantity').isFloat().withMessage('Quantity must be a number'),
+  body('locationId').isInt().withMessage('Location ID must be an integer'),
+  body('reasonId').optional().isInt().withMessage('Reason ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const partId = req.params.id;
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/parts/${partId}/inventory/scrap`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', `/api/parts/${partId}/inventory/scrap`, { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error scrapping inventory:', error.message);
-    res.status(500).json({ error: 'Failed to scrap inventory' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Purchase Order Endpoints
 
 // Get purchase orders
-app.get('/api/purchase-orders', ensureAuthenticated, async (req, res) => {
+app.get('/api/purchase-orders', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/purchase-orders`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/purchase-orders', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching purchase orders:', error.message);
-    res.status(500).json({ error: 'Failed to fetch purchase orders' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Get purchase order by ID
-app.get('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
+app.get('/api/purchase-orders/:id', [
+  param('id').isInt().withMessage('PO ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const poId = req.params.id;
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/purchase-orders/${poId}`, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
-    });
+    const data = await makeRequest('get', `/api/purchase-orders/${poId}`);
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching purchase order:', error.message);
-    res.status(500).json({ error: 'Failed to fetch purchase order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Create purchase order
-app.post('/api/purchase-orders', ensureAuthenticated, async (req, res) => {
+app.post('/api/purchase-orders', [
+  body('vendorId').isInt().withMessage('Vendor ID must be an integer'),
+  body('items').isArray().withMessage('Items must be an array'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/purchase-orders`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', '/api/purchase-orders', { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error creating purchase order:', error.message);
-    res.status(500).json({ error: 'Failed to create purchase order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Update purchase order
-app.post('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
+app.post('/api/purchase-orders/:id', [
+  param('id').isInt().withMessage('PO ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const poId = req.params.id;
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/purchase-orders/${poId}`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', `/api/purchase-orders/${poId}`, { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error updating purchase order:', error.message);
-    res.status(500).json({ error: 'Failed to update purchase order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // PO Actions
-app.post('/api/purchase-orders/:id/:action', ensureAuthenticated, async (req, res) => {
+app.post('/api/purchase-orders/:id/:action', [
+  param('id').isInt().withMessage('PO ID must be an integer'),
+  param('action').isIn(['issue', 'unissue', 'close-short', 'void']).withMessage('Invalid action'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const poId = req.params.id;
     const action = req.params.action;
-    const validActions = ['issue', 'unissue', 'close-short', 'void'];
     
-    if (!validActions.includes(action)) {
-      return res.status(400).json({ error: 'Invalid action' });
-    }
+    const data = await makeRequest('post', `/api/purchase-orders/${poId}/${action}`, { 
+      data: req.body || {} 
+    });
     
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/purchase-orders/${poId}/${action}`, 
-      req.body || {},
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error(`Error performing action ${req.params.action}:`, error.message);
-    res.status(500).json({ error: `Failed to perform action ${req.params.action}` });
+    sendErrorResponse(res, error);
   }
 });
 
 // Close Short PO Item
-app.post('/api/purchase-orders/:id/close-short/:poItemId', ensureAuthenticated, async (req, res) => {
+app.post('/api/purchase-orders/:id/close-short/:poItemId', [
+  param('id').isInt().withMessage('PO ID must be an integer'),
+  param('poItemId').isInt().withMessage('PO Item ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const poId = req.params.id;
     const poItemId = req.params.poItemId;
     
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/purchase-orders/${poId}/close-short/${poItemId}`, 
-      req.body || {},
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', `/api/purchase-orders/${poId}/close-short/${poItemId}`, { 
+      data: req.body || {} 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error closing PO item short:', error.message);
-    res.status(500).json({ error: 'Failed to close PO item short' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Delete purchase order
-app.delete('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
+app.delete('/api/purchase-orders/:id', [
+  param('id').isInt().withMessage('PO ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const poId = req.params.id;
-    const response = await axios.delete(`${FISHBOWL_API_URL}/api/purchase-orders/${poId}`, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
-    });
+    const data = await makeRequest('delete', `/api/purchase-orders/${poId}`);
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error deleting purchase order:', error.message);
-    res.status(500).json({ error: 'Failed to delete purchase order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Manufacture Order Endpoints
 
 // Get manufacture orders
-app.get('/api/manufacture-orders', ensureAuthenticated, async (req, res) => {
+app.get('/api/manufacture-orders', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/manufacture-orders`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/manufacture-orders', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching manufacture orders:', error.message);
-    res.status(500).json({ error: 'Failed to fetch manufacture orders' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Get manufacture order by ID
-app.get('/api/manufacture-orders/:id', ensureAuthenticated, async (req, res) => {
+app.get('/api/manufacture-orders/:id', [
+  param('id').isInt().withMessage('MO ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const moId = req.params.id;
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/manufacture-orders/${moId}`, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
-    });
+    const data = await makeRequest('get', `/api/manufacture-orders/${moId}`);
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching manufacture order:', error.message);
-    res.status(500).json({ error: 'Failed to fetch manufacture order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Create manufacture order
-app.post('/api/manufacture-orders', ensureAuthenticated, async (req, res) => {
+app.post('/api/manufacture-orders', [
+  body('partId').isInt().withMessage('Part ID must be an integer'),
+  body('quantity').isFloat().withMessage('Quantity must be a number'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/manufacture-orders`, 
-      req.body,
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    const data = await makeRequest('post', '/api/manufacture-orders', { 
+      data: req.body 
+    });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error creating manufacture order:', error.message);
-    res.status(500).json({ error: 'Failed to create manufacture order' });
+    sendErrorResponse(res, error);
   }
 });
 
 // MO Actions
-app.post('/api/manufacture-orders/:id/:action', ensureAuthenticated, async (req, res) => {
+app.post('/api/manufacture-orders/:id/:action', [
+  param('id').isInt().withMessage('MO ID must be an integer'),
+  param('action').isIn(['issue', 'unissue', 'close-short']).withMessage('Invalid action'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const moId = req.params.id;
     const action = req.params.action;
-    const validActions = ['issue', 'unissue', 'close-short'];
     
-    if (!validActions.includes(action)) {
-      return res.status(400).json({ error: 'Invalid action' });
-    }
+    const data = await makeRequest('post', `/api/manufacture-orders/${moId}/${action}`, { 
+      data: req.body || {} 
+    });
     
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/manufacture-orders/${moId}/${action}`, 
-      req.body || {},
-      {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error(`Error performing action ${req.params.action}:`, error.message);
-    res.status(500).json({ error: `Failed to perform action ${req.params.action}` });
+    sendErrorResponse(res, error);
   }
 });
 
 // Delete manufacture order
-app.delete('/api/manufacture-orders/:id', ensureAuthenticated, async (req, res) => {
+app.delete('/api/manufacture-orders/:id', [
+  param('id').isInt().withMessage('MO ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const moId = req.params.id;
-    const response = await axios.delete(`${FISHBOWL_API_URL}/api/manufacture-orders/${moId}`, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
-    });
+    const data = await makeRequest('delete', `/api/manufacture-orders/${moId}`);
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error deleting manufacture order:', error.message);
-    res.status(500).json({ error: 'Failed to delete manufacture order' });
+    sendErrorResponse(res, error);
   }
 });
 
@@ -471,95 +632,83 @@ const handleMemos = (type) => {
   router.get('/', ensureAuthenticated, async (req, res) => {
     try {
       const id = req.params.id;
-      const response = await axios.get(`${FISHBOWL_API_URL}/api/${type}/${id}/memos`, {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`
-        }
-      });
+      const data = await makeRequest('get', `/api/${type}/${id}/memos`);
       
-      res.json(response.data);
+      res.json(data);
     } catch (error) {
-      console.error(`Error fetching ${type} memos:`, error.message);
-      res.status(500).json({ error: `Failed to fetch ${type} memos` });
+      sendErrorResponse(res, error);
     }
   });
   
   // Get memo by ID
-  router.get('/:memoId', ensureAuthenticated, async (req, res) => {
+  router.get('/:memoId', [
+    param('memoId').isInt().withMessage('Memo ID must be an integer'),
+    validateRequest,
+    ensureAuthenticated
+  ], async (req, res) => {
     try {
       const id = req.params.id;
       const memoId = req.params.memoId;
-      const response = await axios.get(`${FISHBOWL_API_URL}/api/${type}/${id}/memos/${memoId}`, {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`
-        }
-      });
+      const data = await makeRequest('get', `/api/${type}/${id}/memos/${memoId}`);
       
-      res.json(response.data);
+      res.json(data);
     } catch (error) {
-      console.error(`Error fetching ${type} memo:`, error.message);
-      res.status(500).json({ error: `Failed to fetch ${type} memo` });
+      sendErrorResponse(res, error);
     }
   });
   
   // Create memo
-  router.post('/', ensureAuthenticated, async (req, res) => {
+  router.post('/', [
+    body('text').isString().withMessage('Memo text is required'),
+    validateRequest,
+    ensureAuthenticated
+  ], async (req, res) => {
     try {
       const id = req.params.id;
-      const response = await axios.post(`${FISHBOWL_API_URL}/api/${type}/${id}/memos`, 
-        req.body,
-        {
-          headers: {
-            'Authorization': `Bearer ${fishbowlToken}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+      const data = await makeRequest('post', `/api/${type}/${id}/memos`, { 
+        data: req.body 
+      });
       
-      res.json(response.data);
+      res.json(data);
     } catch (error) {
-      console.error(`Error creating ${type} memo:`, error.message);
-      res.status(500).json({ error: `Failed to create ${type} memo` });
+      sendErrorResponse(res, error);
     }
   });
   
   // Update memo
-  router.post('/:memoId', ensureAuthenticated, async (req, res) => {
+  router.post('/:memoId', [
+    param('memoId').isInt().withMessage('Memo ID must be an integer'),
+    body('text').isString().withMessage('Memo text is required'),
+    validateRequest,
+    ensureAuthenticated
+  ], async (req, res) => {
     try {
       const id = req.params.id;
       const memoId = req.params.memoId;
-      const response = await axios.post(`${FISHBOWL_API_URL}/api/${type}/${id}/memos/${memoId}`, 
-        req.body,
-        {
-          headers: {
-            'Authorization': `Bearer ${fishbowlToken}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+      const data = await makeRequest('post', `/api/${type}/${id}/memos/${memoId}`, { 
+        data: req.body 
+      });
       
-      res.json(response.data);
+      res.json(data);
     } catch (error) {
-      console.error(`Error updating ${type} memo:`, error.message);
-      res.status(500).json({ error: `Failed to update ${type} memo` });
+      sendErrorResponse(res, error);
     }
   });
   
   // Delete memo
-  router.delete('/:memoId', ensureAuthenticated, async (req, res) => {
+  router.delete('/:memoId', [
+    param('memoId').isInt().withMessage('Memo ID must be an integer'),
+    validateRequest,
+    ensureAuthenticated
+  ], async (req, res) => {
     try {
       const id = req.params.id;
       const memoId = req.params.memoId;
-      const response = await axios.delete(`${FISHBOWL_API_URL}/api/${type}/${id}/memos/${memoId}`, {
-        headers: {
-          'Authorization': `Bearer ${fishbowlToken}`
-        }
-      });
+      const data = await makeRequest('delete', `/api/${type}/${id}/memos/${memoId}`);
       
-      res.json(response.data);
+      res.json(data);
     } catch (error) {
-      console.error(`Error deleting ${type} memo:`, error.message);
-      res.status(500).json({ error: `Failed to delete ${type} memo` });
+      sendErrorResponse(res, error);
     }
   });
   
@@ -567,83 +716,84 @@ const handleMemos = (type) => {
 };
 
 // Apply memo routes
-app.use('/api/purchase-orders/:id/memos', handleMemos('purchase-orders'));
-app.use('/api/manufacture-orders/:id/memos', handleMemos('manufacture-orders'));
+app.use('/api/purchase-orders/:id/memos', [
+  param('id').isInt().withMessage('ID must be an integer'),
+  validateRequest
+], handleMemos('purchase-orders'));
+
+app.use('/api/manufacture-orders/:id/memos', [
+  param('id').isInt().withMessage('ID must be an integer'),
+  validateRequest
+], handleMemos('manufacture-orders'));
 
 // Products Endpoints
 
 // Get product best price
-app.get('/api/products/:id/best-price', ensureAuthenticated, async (req, res) => {
+app.get('/api/products/:id/best-price', [
+  param('id').isInt().withMessage('Product ID must be an integer'),
+  validateRequest,
+  ensureAuthenticated
+], async (req, res) => {
   try {
     const productId = req.params.id;
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/products/${productId}/best-price`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', `/api/products/${productId}/best-price`, { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching product best price:', error.message);
-    res.status(500).json({ error: 'Failed to fetch product best price' });
+    sendErrorResponse(res, error);
   }
 });
 
 // UOM Endpoints
 
 // Get UOMs
-app.get('/api/uoms', ensureAuthenticated, async (req, res) => {
+app.get('/api/uoms', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/uoms`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/uoms', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching UOMs:', error.message);
-    res.status(500).json({ error: 'Failed to fetch UOMs' });
+    sendErrorResponse(res, error);
   }
 });
 
 // Vendor Endpoints
 
 // Get vendors
-app.get('/api/vendors', ensureAuthenticated, async (req, res) => {
+app.get('/api/vendors', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/vendors`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/vendors', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching vendors:', error.message);
-    res.status(500).json({ error: 'Failed to fetch vendors' });
+    sendErrorResponse(res, error);
   }
 });
 
 // User Endpoints
 
 // Get users
-app.get('/api/users', ensureAuthenticated, async (req, res) => {
+app.get('/api/users', [
+  ensureAuthenticated
+], async (req, res) => {
   try {
-    const response = await axios.get(`${FISHBOWL_API_URL}/api/users`, {
-      params: req.query,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`
-      }
+    const data = await makeRequest('get', '/api/users', { 
+      params: req.query 
     });
     
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
-    console.error('Error fetching users:', error.message);
-    res.status(500).json({ error: 'Failed to fetch users' });
+    sendErrorResponse(res, error);
   }
 });
 
@@ -652,15 +802,69 @@ app.use(errorHandler);
 
 // 404 handler
 app.use((req, res, next) => {
-  res.status(404).json({ error: 'Not Found', message: `Route ${req.method} ${req.url} not found` });
+  res.status(404).json({ 
+    error: 'Not Found', 
+    message: `Route ${req.method} ${req.url} not found` 
+  });
 });
 
 // Start the server
-app.listen(PORT, () => {
+// Process uncaught exceptions and unhandled rejections
+process.on('uncaughtException', (error) => {
+  console.error('UNCAUGHT EXCEPTION:', error);
+  console.error('Stack trace:', error.stack);
+  // Keep the process alive but log the error
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION at:', promise);
+  console.error('Reason:', reason);
+  // Keep the process alive but log the error
+});
+
+// Create a graceful shutdown function
+const gracefulShutdown = () => {
+  console.log('Shutting down gracefully...');
+  
+  // Attempt to logout if we have a token
+  if (fishbowlToken) {
+    axios.post(`${FISHBOWL_API_URL}/api/logout`, {}, {
+      headers: {
+        'Authorization': `Bearer ${fishbowlToken}`,
+        'Content-Type': 'application/json'
+      }
+    }).catch(() => {
+      console.log('Logout failed during shutdown, but continuing shutdown process');
+    });
+  }
+  
+  // Exit the process
+  process.exit(0);
+};
+
+// Listen for termination signals
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+// Start server and handle errors
+const server = app.listen(PORT, () => {
   console.log(`MCP Server listening on port ${PORT}`);
   
   // Try to login on startup
   login().catch(err => {
     console.error('Initial login failed:', err.message);
+    console.log('Server will attempt to login again when handling requests');
   });
 });
+
+// Handle server errors
+server.on('error', (error) => {
+  console.error('Server error:', error);
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Please choose a different port.`);
+    process.exit(1);
+  }
+});
+
+// Export for testing purposes
+module.exports = app;
