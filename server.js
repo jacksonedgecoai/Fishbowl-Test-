@@ -30,7 +30,7 @@ const isValidNumber = (num) => {
 // No need to require it again// server.js - Main server file for Fishbowl MCP Server
 
 // Check for required dependencies and handle missing modules gracefully
-let express, axios, cors, dotenv, errorHandlerModule, errorHandler, ApiError, fs, path;
+let express, axios, cors, dotenv, errorHandlerModule, errorHandler, ApiError, fs, path, rateLimit, validator;
 
 try {
   fs = require('fs');
@@ -76,13 +76,27 @@ try {
 }
 
 // Optional dependencies with fallbacks
-let rateLimit;
 try {
   rateLimit = require('express-rate-limit');
+  console.log('Loaded express-rate-limit module');
 } catch (error) {
   console.warn('express-rate-limit module not found. Rate limiting will be disabled.');
   // Provide a no-op middleware as fallback
   rateLimit = () => (req, res, next) => next();
+}
+
+// Proper validation fallbacks
+try {
+  validator = require('express-validator');
+  console.log('Loaded express-validator module');
+} catch (error) {
+  console.warn('express-validator module not found. Input validation will be disabled.');
+  validator = {
+    body: () => () => (req, res, next) => next(),
+    param: () => () => (req, res, next) => next(),
+    query: () => () => (req, res, next) => next(),
+    validationResult: req => ({ isEmpty: () => true, array: () => [] })
+  };
 }
 
 // Optional dependencies with fallbacks
@@ -95,21 +109,7 @@ try {
   rateLimit = () => (req, res, next) => next();
 }
 
-// Proper validation fallbacks
-let validator = {
-  body: () => () => (req, res, next) => next(),
-  param: () => () => (req, res, next) => next(),
-  query: () => () => (req, res, next) => next(),
-  validationResult: req => ({ isEmpty: () => true, array: () => [] })
-};
-
-try {
-  const expressValidator = require('express-validator');
-  validator = expressValidator;
-} catch (error) {
-  console.warn('express-validator module not found. Input validation will be disabled.');
-}
-
+// No need to redeclare these variables - they're already declared at the top
 const { body, param, query, validationResult } = validator;
 
 // Create a simple error handler file if it doesn't exist
