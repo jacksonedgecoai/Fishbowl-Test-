@@ -1,936 +1,755 @@
-// server.js - Main server file for Fishbowl MCP Server
-
-// Single declaration block for all variables
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
-let dotenv, rateLimit, validator;
+const net = require('net');
+const xml2js = require('xml2js');
+const axios = require('axios');
+require('dotenv').config();
 
-// Basic error handler class and function
-class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
-const errorHandler = (err, req, res, next) => {
-  console.error('Error occurred:', err);
-  const status = err.status || 500;
-  const message = err.message || 'An unexpected error occurred';
-  res.status(status).json({ error: message });
-};
-
-// Initialize express app
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Load environment variables
-try {
-  dotenv = require('dotenv');
-  dotenv.config();
-  console.log('Environment variables loaded');
-} catch (error) {
-  console.warn('Failed to load dotenv. Using default values.', error.message);
-}
-
-// Try to load optional dependencies
-try {
-  rateLimit = require('express-rate-limit');
-  console.log('Rate limiting enabled');
-} catch (error) {
-  console.warn('express-rate-limit not found. Rate limiting disabled.');
-  // Fallback no-op middleware
-  rateLimit = () => (req, res, next) => next();
-}
-
-try {
-  validator = require('express-validator');
-  console.log('Request validation enabled');
-} catch (error) {
-  console.warn('express-validator not found. Validation disabled.');
-  // Minimal validation functions as fallbacks
-  validator = {
-    body: () => (req, res, next) => next(),
-    param: () => (req, res, next) => next(),
-    query: () => (req, res, next) => next(),
-    validationResult: req => ({ isEmpty: () => true, array: () => [] })
-  };
-}
-
-// Extract validation functions
-const { body, param, query, validationResult } = validator;
-
-// Configure middleware
-app.use(express.json());
+// Middleware
 app.use(cors());
+app.use(express.json());
 
-// Apply rate limiting if available
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later'
-});
-app.use('/api/', apiLimiter);
+// XML parser and builder
+const xmlParser = new xml2js.Parser();
+const xmlBuilder = new xml2js.Builder();
 
-// Fishbowl API base URL
-const FISHBOWL_API_URL = process.env.FISHBOWL_API_URL || 'http://localhost:80';
-
-// Authentication token storage and expiration
-let fishbowlToken = null;
-let tokenExpiration = null;
-const TOKEN_REFRESH_THRESHOLD = 10 * 60 * 1000; // 10 minutes before expiration
-
-// Set default axios timeout
-axios.defaults.timeout = 30000; // 30 seconds
-
-// Error response helper - Fixed missing parenthesis
-const sendErrorResponse = (res, error) => {
-  console.error(`Error: ${error.message}`, error.stack);
-  const status = error.response?.status || 500;
-  const errorMessage = error.response?.data?.error || error.message || 'An unexpected error occurred';
-  res.status(status).json({ error: errorMessage });
-};
-
-// Input validation middleware with error handling
-const validateRequest = (req, res, next) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-    next();
-  } catch (error) {
-    console.error('Validation error:', error);
-    // Continue with the request if validation fails
-    next();
-  }
-};
-
-// Simple validation functions
-const isValidId = (id) => {
-  const parsedId = parseInt(id, 10);
-  return !isNaN(parsedId) && parsedId > 0;
-};
-
-const isValidString = (str) => {
-  return typeof str === 'string' && str.trim().length > 0;
-};
-
-const isValidNumber = (num) => {
-  const parsed = parseFloat(num);
-  return !isNaN(parsed);
-};
-
-// Login middleware to ensure we have a valid token
-const ensureAuthenticated = async (req, res, next) => {
-  try {
-    // Check if token is missing or close to expiration
-    const now = Date.now();
-    if (!fishbowlToken || (tokenExpiration && now > tokenExpiration - TOKEN_REFRESH_THRESHOLD)) {
-      await login();
-    }
-    next();
-  } catch (error) {
-    console.error('Authentication failed:', error.message);
-    return res.status(401).json({ error: 'Authentication with Fishbowl failed' });
-  }
-};
-
-// Login to Fishbowl API
-const login = async () => {
-  try {
-    // Check if required credentials are set
-    if (!process.env.FISHBOWL_USERNAME || !process.env.FISHBOWL_PASSWORD) {
-      console.error('Missing required environment variables: FISHBOWL_USERNAME and/or FISHBOWL_PASSWORD');
-      throw new Error('Missing Fishbowl credentials. Please check your .env file.');
-    }
+// Fishbowl API Client
+class FishbowlClient {
+  constructor() {
+    // Native Fishbowl API settings
+    this.host = process.env.FISHBOWL_HOST || 'localhost';
+    this.port = parseInt(process.env.FISHBOWL_PORT) || 28192;
+    this.username = process.env.FISHBOWL_USERNAME;
+    this.password = process.env.FISHBOWL_PASSWORD;
+    this.iaid = process.env.FISHBOWL_IAID || '54321';
     
-    const appName = process.env.FISHBOWL_APP_NAME || "MCP Server";
-    let appId;
+    // REST API settings (if available)
+    this.restApiUrl = process.env.FISHBOWL_REST_API_URL;
+    this.appName = process.env.FISHBOWL_APP_NAME || 'MCP Fishbowl Server';
+    this.appId = process.env.FISHBOWL_APP_ID || '101';
     
+    // Session state
+    this.client = null;
+    this.sessionToken = null;
+    this.userId = null;
+    this.restApiToken = null;
+  }
+
+  async connect() {
+    return new Promise((resolve, reject) => {
+      this.client = new net.Socket();
+      
+      this.client.connect(this.port, this.host, () => {
+        console.log(`Connected to Fishbowl server at ${this.host}:${this.port}`);
+        resolve();
+      });
+
+      this.client.on('error', (error) => {
+        console.error('Connection error:', error);
+        reject(error);
+      });
+      
+      this.client.on('close', () => {
+        console.log('Fishbowl connection closed');
+        this.client = null;
+        this.sessionToken = null;
+      });
+    });
+  }
+
+  async ensureConnected() {
+    if (!this.client) {
+      await this.connect();
+    }
+    return this.client;
+  }
+
+  async sendRequest(requestXml) {
+    await this.ensureConnected();
+    
+    return new Promise((resolve, reject) => {
+      let responseData = '';
+      
+      // Set up a temporary data handler for this request
+      const dataHandler = (data) => {
+        responseData += data.toString();
+        // Check if we have received the complete response
+        if (responseData.includes('</FbiXml>')) {
+          this.client.removeListener('data', dataHandler);
+          resolve(responseData);
+        }
+      };
+
+      const errorHandler = (error) => {
+        this.client.removeListener('data', dataHandler);
+        this.client.removeListener('error', errorHandler);
+        reject(error);
+      };
+
+      this.client.on('data', dataHandler);
+      this.client.on('error', errorHandler);
+
+      // Send the request
+      this.client.write(requestXml);
+    });
+  }
+
+  async login() {
     try {
-      appId = parseInt(process.env.FISHBOWL_APP_ID || "101");
-      if (isNaN(appId)) {
-        throw new Error('Invalid appId');
-      }
-    } catch (parseError) {
-      console.error('Invalid FISHBOWL_APP_ID:', process.env.FISHBOWL_APP_ID);
-      appId = 101; // Default value
-    }
-    
-    // Attempt login with timeout
-    const response = await axios.post(`${FISHBOWL_API_URL}/api/login`, {
-      appName: appName,
-      appId: appId,
-      username: process.env.FISHBOWL_USERNAME,
-      password: process.env.FISHBOWL_PASSWORD
-    }, {
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000 // 10 second timeout specifically for login
-    });
+      await this.ensureConnected();
 
-    if (response.data && response.data.token) {
-      fishbowlToken = response.data.token;
-      
-      // Set token expiration time (assuming token is valid for 24 hours)
-      // Adjust this based on actual Fishbowl API token lifetime
-      tokenExpiration = Date.now() + (24 * 60 * 60 * 1000);
-      
-      console.log('Successfully authenticated with Fishbowl');
-      return true;
-    } else {
-      console.error('No token received from Fishbowl API');
-      throw new Error('Authentication failed - no token received');
-    }
-  } catch (error) {
-    // More detailed error logging
-    if (error.response) {
-      // The request was made and the server responded with a status code outside of 2xx
-      console.error('Login failed with status:', error.response.status);
-      console.error('Response data:', error.response.data);
-    } else if (error.request) {
-      // The request was made but no response was received
-      console.error('No response received from Fishbowl API');
-      console.error('Request:', error.request);
-      
-      // Add connectivity check
-      try {
-        await axios.get(`${FISHBOWL_API_URL}/api/health`, { timeout: 5000 });
-        console.error('Fishbowl API is reachable but login failed');
-      } catch (connectError) {
-        console.error('Cannot connect to Fishbowl API:', connectError.message);
-      }
-    } else {
-      // Something happened in setting up the request that triggered an error
-      console.error('Login error:', error.message);
-    }
-    
-    throw error;
-  }
-};
-
-// Request wrapper with error handling
-const makeRequest = async (method, url, options = {}) => {
-  try {
-    const response = await axios({
-      method,
-      url: `${FISHBOWL_API_URL}${url}`,
-      ...options,
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`,
-        'Content-Type': 'application/json',
-        ...(options.headers || {})
-      }
-    });
-    return response.data;
-  } catch (error) {
-    // Check if error is due to token expiration
-    if (error.response && error.response.status === 401) {
-      // Try to refresh token and retry the request once
-      try {
-        await login();
-        const retryResponse = await axios({
-          method,
-          url: `${FISHBOWL_API_URL}${url}`,
-          ...options,
-          headers: {
-            'Authorization': `Bearer ${fishbowlToken}`,
-            'Content-Type': 'application/json',
-            ...(options.headers || {})
+      const loginRequest = {
+        FbiXml: {
+          $: { version: '1.0' },
+          Ticket: {},
+          FbiMsgsRq: {
+            LoginRq: {
+              IAID: this.iaid,
+              IAName: this.appName,
+              IADescription: 'MCP Server for Fishbowl Integration',
+              UserName: this.username,
+              UserPassword: this.password
+            }
           }
-        });
-        return retryResponse.data;
-      } catch (retryError) {
-        throw retryError;
+        }
+      };
+
+      const requestXml = xmlBuilder.buildObject(loginRequest);
+      const response = await this.sendRequest(requestXml);
+      const result = await xmlParser.parseStringPromise(response);
+
+      // Check for errors
+      if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+          result.FbiXml.FbiMsgsRs[0].LoginRs && 
+          result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusCode) {
+        
+        const statusCode = result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusCode[0];
+        
+        if (statusCode === '1000') {
+          if (result.FbiXml.Ticket && result.FbiXml.Ticket[0]) {
+            this.sessionToken = result.FbiXml.Ticket[0].Key ? result.FbiXml.Ticket[0].Key[0] : null;
+            this.userId = result.FbiXml.Ticket[0].UserID ? result.FbiXml.Ticket[0].UserID[0] : null;
+            console.log('Successfully logged in to Fishbowl');
+            return { success: true, token: this.sessionToken, userId: this.userId };
+          }
+        } else {
+          const statusMessage = result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusMessage ? 
+              result.FbiXml.FbiMsgsRs[0].LoginRs[0].StatusMessage[0] : 'Unknown error';
+          throw new Error(`Login failed: ${statusCode} - ${statusMessage}`);
+        }
+      }
+      
+      throw new Error('Login failed: Unexpected response format');
+    } catch (error) {
+      console.error('Login error:', error);
+      throw error;
+    }
+  }
+
+  async ensureAuthenticated() {
+    if (!this.sessionToken) {
+      await this.login();
+    }
+    return this.sessionToken;
+  }
+
+  async getInventory(partNumber) {
+    await this.ensureAuthenticated();
+
+    const inventoryRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          PartQuantityRq: {
+            PartNum: partNumber
+          }
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(inventoryRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].PartQuantityRs && 
+        result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].PartQuantityRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to get inventory: ${statusCode} - ${statusMessage}`);
       }
     }
-    throw error;
-  }
-};
 
-// Fishbowl API Routes
+    return result;
+  }
+
+  async getProducts() {
+    await this.ensureAuthenticated();
+
+    const productsRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          ProductGetRq: {
+            GetAll: 'true'
+          }
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(productsRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].ProductGetRs && 
+        result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].ProductGetRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to get products: ${statusCode} - ${statusMessage}`);
+      }
+    }
+
+    return result;
+  }
+
+  async getParts() {
+    await this.ensureAuthenticated();
+
+    const partsRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          PartGetRq: {
+            GetAll: 'true'
+          }
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(partsRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].PartGetRs && 
+        result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].PartGetRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to get parts: ${statusCode} - ${statusMessage}`);
+      }
+    }
+
+    return result;
+  }
+
+  // Custom method to add inventory - uses the XML approach
+  async addInventory(partId, locationId, quantity, trackingItems = []) {
+    await this.ensureAuthenticated();
+
+    const trackingItemsXml = trackingItems.map(item => {
+      return {
+        TrackingItem: {
+          PartTracking: {
+            ID: item.partTracking.id
+          },
+          Value: item.value
+        }
+      };
+    });
+
+    const addInventoryRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          InventoryAddRq: {
+            PartID: partId,
+            LocationID: locationId,
+            Quantity: quantity,
+            TrackingItems: trackingItemsXml
+          }
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(addInventoryRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].InventoryAddRs && 
+        result.FbiXml.FbiMsgsRs[0].InventoryAddRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].InventoryAddRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].InventoryAddRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].InventoryAddRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to add inventory: ${statusCode} - ${statusMessage}`);
+      }
+    }
+
+    return result;
+  }
+
+  async getManufactureOrders(filters = {}) {
+    await this.ensureAuthenticated();
+
+    // Convert filters to XML format
+    const filtersObj = {};
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null && value !== '') {
+        filtersObj[key] = value;
+      }
+    }
+
+    const moRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          ManufactureOrderQueryRq: filtersObj
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(moRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].ManufactureOrderQueryRs && 
+        result.FbiXml.FbiMsgsRs[0].ManufactureOrderQueryRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].ManufactureOrderQueryRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].ManufactureOrderQueryRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].ManufactureOrderQueryRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to get manufacture orders: ${statusCode} - ${statusMessage}`);
+      }
+    }
+
+    return result;
+  }
+
+  async getPurchaseOrders(filters = {}) {
+    await this.ensureAuthenticated();
+
+    // Convert filters to XML format
+    const filtersObj = {};
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null && value !== '') {
+        filtersObj[key] = value;
+      }
+    }
+
+    const poRequest = {
+      FbiXml: {
+        Ticket: {
+          Key: this.sessionToken
+        },
+        FbiMsgsRq: {
+          PurchaseOrderQueryRq: filtersObj
+        }
+      }
+    };
+
+    const requestXml = xmlBuilder.buildObject(poRequest);
+    const response = await this.sendRequest(requestXml);
+    const result = await xmlParser.parseStringPromise(response);
+
+    // Check for errors
+    if (result.FbiXml && result.FbiXml.FbiMsgsRs && 
+        result.FbiXml.FbiMsgsRs[0].PurchaseOrderQueryRs && 
+        result.FbiXml.FbiMsgsRs[0].PurchaseOrderQueryRs[0].StatusCode) {
+      
+      const statusCode = result.FbiXml.FbiMsgsRs[0].PurchaseOrderQueryRs[0].StatusCode[0];
+      
+      if (statusCode !== '1000') {
+        const statusMessage = result.FbiXml.FbiMsgsRs[0].PurchaseOrderQueryRs[0].StatusMessage ? 
+            result.FbiXml.FbiMsgsRs[0].PurchaseOrderQueryRs[0].StatusMessage[0] : 'Unknown error';
+        throw new Error(`Failed to get purchase orders: ${statusCode} - ${statusMessage}`);
+      }
+    }
+
+    return result;
+  }
+
+  async logout() {
+    if (!this.sessionToken) {
+      return { success: true, message: 'Not logged in' };
+    }
+
+    try {
+      const logoutRequest = {
+        FbiXml: {
+          Ticket: {
+            Key: this.sessionToken
+          },
+          FbiMsgsRq: {
+            LogoutRq: {}
+          }
+        }
+      };
+
+      const requestXml = xmlBuilder.buildObject(logoutRequest);
+      const response = await this.sendRequest(requestXml);
+      const result = await xmlParser.parseStringPromise(response);
+
+      // Reset session data
+      this.sessionToken = null;
+      this.userId = null;
+
+      return { success: true, message: 'Successfully logged out of Fishbowl' };
+    } catch (error) {
+      console.error('Logout error:', error);
+      // Reset session data even if the logout request fails
+      this.sessionToken = null;
+      this.userId = null;
+      return { success: false, error: error.message };
+    }
+  }
+
+  disconnect() {
+    if (this.client) {
+      // Attempt to logout if we have a session
+      if (this.sessionToken) {
+        this.logout().catch(console.error);
+      }
+      
+      this.client.destroy();
+      this.client = null;
+      this.sessionToken = null;
+      this.userId = null;
+      console.log('Disconnected from Fishbowl server');
+      return { success: true, message: 'Disconnected from Fishbowl server' };
+    }
+    
+    return { success: true, message: 'Not connected to Fishbowl server' };
+  }
+}
+
+// Create Fishbowl client instance
+const fishbowl = new FishbowlClient();
+
+// Root route handler - Add this to fix the "Route GET / not found" error
+app.get('/', (req, res) => {
+  res.json({
+    service: 'MCP Fishbowl Server',
+    version: '1.0.0',
+    status: 'running',
+    documentation: '/docs',
+    healthCheck: '/health',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Documentation route
+app.get('/docs', (req, res) => {
+  res.json({
+    service: 'MCP Fishbowl Server',
+    version: '1.0.0',
+    description: 'An MCP server for accessing data from Fishbowl Inventory',
+    endpoints: [
+      { path: '/', method: 'GET', description: 'Service information' },
+      { path: '/health', method: 'GET', description: 'Health check endpoint' },
+      { path: '/status', method: 'GET', description: 'Connection status to Fishbowl' },
+      { path: '/mcp/execute', method: 'POST', description: 'MCP command execution endpoint' },
+      { path: '/mcp/inventory/:partNumber', method: 'GET', description: 'Get inventory for a specific part' },
+      { path: '/mcp/products', method: 'GET', description: 'Get all products' },
+      { path: '/mcp/parts', method: 'GET', description: 'Get all parts' },
+      { path: '/mcp/manufacture-orders', method: 'GET', description: 'Search manufacture orders' },
+      { path: '/mcp/purchase-orders', method: 'GET', description: 'Search purchase orders' },
+      { path: '/mcp/inventory/add', method: 'POST', description: 'Add inventory' }
+    ],
+    mcp_commands: [
+      'getInventory', 'getProducts', 'getParts', 'getManufactureOrders', 
+      'getPurchaseOrders', 'addInventory', 'login', 'logout', 'connect', 'disconnect'
+    ]
+  });
+});
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  const tokenStatus = fishbowlToken ? 'valid' : 'not authenticated';
-  const tokenExpiresIn = tokenExpiration ? Math.max(0, Math.floor((tokenExpiration - Date.now()) / 1000)) : 'unknown';
-  
-  res.json({ 
-    status: 'ok', 
-    authenticated: !!fishbowlToken,
-    tokenStatus,
-    tokenExpiresIn: tokenExpiration ? `${tokenExpiresIn} seconds` : 'unknown'
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    service: 'MCP Fishbowl Server'
   });
 });
 
-// Login endpoint
-app.post('/api/login', async (req, res) => {
+// Status endpoint
+app.get('/status', async (req, res) => {
   try {
-    await login();
-    res.json({ success: true });
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Logout endpoint
-app.post('/api/logout', ensureAuthenticated, async (req, res) => {
-  try {
-    await makeRequest('post', '/api/logout', { data: {} });
+    const connected = fishbowl.client !== null;
+    const authenticated = fishbowl.sessionToken !== null;
     
-    fishbowlToken = null;
-    tokenExpiration = null;
-    res.json({ success: true });
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Parts Endpoints
-
-// Get parts inventory
-app.get('/api/parts/inventory', ensureAuthenticated, async (req, res) => {
-  try {
-    const partNumber = req.query.number;
-    const data = await makeRequest('get', '/api/parts/inventory', { 
-      params: { number: partNumber } 
+    res.json({
+      status: authenticated ? 'authenticated' : (connected ? 'connected' : 'disconnected'),
+      host: fishbowl.host,
+      port: fishbowl.port,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Get parts
-app.get('/api/parts', ensureAuthenticated, async (req, res) => {
-  try {
-    const data = await makeRequest('get', '/api/parts/', { 
-      params: req.query 
+    res.status(500).json({
+      status: 'error',
+      error: error.message,
+      fishbowlHost: fishbowl.host,
+      fishbowlPort: fishbowl.port,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Get part best cost
-app.get('/api/parts/:id/best-cost', ensureAuthenticated, async (req, res) => {
+// MCP endpoint to execute commands
+app.post('/mcp/execute', async (req, res) => {
   try {
-    const partId = req.params.id;
+    const { command, parameters } = req.body;
     
-    // Manual validation
-    if (!isValidId(partId)) {
-      return res.status(400).json({ error: 'Part ID must be a positive integer' });
+    let result;
+    switch (command) {
+      case 'getInventory':
+        if (!parameters || !parameters.partNumber) {
+          throw new Error('Part number is required for inventory lookup');
+        }
+        result = await fishbowl.getInventory(parameters.partNumber);
+        break;
+      
+      case 'getProducts':
+        result = await fishbowl.getProducts();
+        break;
+      
+      case 'getParts':
+        result = await fishbowl.getParts();
+        break;
+        
+      case 'getManufactureOrders':
+        result = await fishbowl.getManufactureOrders(parameters || {});
+        break;
+        
+      case 'getPurchaseOrders':
+        result = await fishbowl.getPurchaseOrders(parameters || {});
+        break;
+        
+      case 'addInventory':
+        if (!parameters || !parameters.partId || !parameters.locationId || parameters.quantity === undefined) {
+          throw new Error('partId, locationId, and quantity are required to add inventory');
+        }
+        result = await fishbowl.addInventory(
+          parameters.partId, 
+          parameters.locationId, 
+          parameters.quantity, 
+          parameters.trackingItems || []
+        );
+        break;
+      
+      case 'login':
+        result = await fishbowl.login();
+        break;
+        
+      case 'logout':
+        result = await fishbowl.logout();
+        break;
+        
+      case 'connect':
+        result = await fishbowl.connect();
+        break;
+        
+      case 'disconnect':
+        result = fishbowl.disconnect();
+        break;
+      
+      default:
+        throw new Error(`Unknown command: ${command}`);
     }
     
-    const data = await makeRequest('get', `/api/parts/${partId}/best-cost`, { 
-      params: req.query 
+    res.json({
+      success: true,
+      result: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Add inventory
-app.post('/api/parts/:id/inventory/add', ensureAuthenticated, async (req, res) => {
-  try {
-    const partId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(partId)) {
-      return res.status(400).json({ error: 'Part ID must be a positive integer' });
-    }
-    
-    if (!isValidNumber(req.body.quantity)) {
-      return res.status(400).json({ error: 'Quantity must be a number' });
-    }
-    
-    if (!isValidId(req.body.locationId)) {
-      return res.status(400).json({ error: 'Location ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('post', `/api/parts/${partId}/inventory/add`, { 
-      data: req.body 
+    console.error('Error executing command:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Cycle inventory
-app.post('/api/parts/:id/inventory/cycle', ensureAuthenticated, async (req, res) => {
+// Additional specific endpoints for easier access
+app.get('/mcp/inventory/:partNumber', async (req, res) => {
   try {
-    const partId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(partId)) {
-      return res.status(400).json({ error: 'Part ID must be a positive integer' });
-    }
-    
-    if (!isValidNumber(req.body.quantity)) {
-      return res.status(400).json({ error: 'Quantity must be a number' });
-    }
-    
-    if (!isValidId(req.body.locationId)) {
-      return res.status(400).json({ error: 'Location ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('post', `/api/parts/${partId}/inventory/cycle`, { 
-      data: req.body 
+    const result = await fishbowl.getInventory(req.params.partNumber);
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Scrap inventory
-app.post('/api/parts/:id/inventory/scrap', ensureAuthenticated, async (req, res) => {
-  try {
-    const partId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(partId)) {
-      return res.status(400).json({ error: 'Part ID must be a positive integer' });
-    }
-    
-    if (!isValidNumber(req.body.quantity)) {
-      return res.status(400).json({ error: 'Quantity must be a number' });
-    }
-    
-    if (!isValidId(req.body.locationId)) {
-      return res.status(400).json({ error: 'Location ID must be a positive integer' });
-    }
-    
-    if (req.body.reasonId && !isValidId(req.body.reasonId)) {
-      return res.status(400).json({ error: 'Reason ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('post', `/api/parts/${partId}/inventory/scrap`, { 
-      data: req.body 
+    console.error('Error getting inventory:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Purchase Order Endpoints
-
-// Get purchase orders
-app.get('/api/purchase-orders', ensureAuthenticated, async (req, res) => {
+app.get('/mcp/products', async (req, res) => {
   try {
-    const data = await makeRequest('get', '/api/purchase-orders', { 
-      params: req.query 
+    const result = await fishbowl.getProducts();
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Get purchase order by ID
-app.get('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
-  try {
-    const poId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(poId)) {
-      return res.status(400).json({ error: 'PO ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('get', `/api/purchase-orders/${poId}`);
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Create purchase order
-app.post('/api/purchase-orders', ensureAuthenticated, async (req, res) => {
-  try {
-    // Manual validation
-    if (!isValidId(req.body.vendorId)) {
-      return res.status(400).json({ error: 'Vendor ID must be a positive integer' });
-    }
-    
-    if (!Array.isArray(req.body.items)) {
-      return res.status(400).json({ error: 'Items must be an array' });
-    }
-    
-    const data = await makeRequest('post', '/api/purchase-orders', { 
-      data: req.body 
+    console.error('Error getting products:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Update purchase order
-app.post('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
+app.get('/mcp/parts', async (req, res) => {
   try {
-    const poId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(poId)) {
-      return res.status(400).json({ error: 'PO ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('post', `/api/purchase-orders/${poId}`, { 
-      data: req.body 
+    const result = await fishbowl.getParts();
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// PO Actions
-app.post('/api/purchase-orders/:id/:action', ensureAuthenticated, async (req, res) => {
-  try {
-    const poId = req.params.id;
-    const action = req.params.action;
-    
-    // Manual validation
-    if (!isValidId(poId)) {
-      return res.status(400).json({ error: 'PO ID must be a positive integer' });
-    }
-    
-    const validActions = ['issue', 'unissue', 'close-short', 'void'];
-    if (!validActions.includes(action)) {
-      return res.status(400).json({ error: 'Invalid action' });
-    }
-    
-    const data = await makeRequest('post', `/api/purchase-orders/${poId}/${action}`, { 
-      data: req.body || {} 
+    console.error('Error getting parts:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Close Short PO Item
-app.post('/api/purchase-orders/:id/close-short/:poItemId', ensureAuthenticated, async (req, res) => {
+app.get('/mcp/manufacture-orders', async (req, res) => {
   try {
-    const poId = req.params.id;
-    const poItemId = req.params.poItemId;
-    
-    // Manual validation
-    if (!isValidId(poId)) {
-      return res.status(400).json({ error: 'PO ID must be a positive integer' });
-    }
-    
-    if (!isValidId(poItemId)) {
-      return res.status(400).json({ error: 'PO Item ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('post', `/api/purchase-orders/${poId}/close-short/${poItemId}`, { 
-      data: req.body || {} 
+    const result = await fishbowl.getManufactureOrders(req.query);
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Delete purchase order
-app.delete('/api/purchase-orders/:id', ensureAuthenticated, async (req, res) => {
-  try {
-    const poId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(poId)) {
-      return res.status(400).json({ error: 'PO ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('delete', `/api/purchase-orders/${poId}`);
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Manufacture Order Endpoints
-
-// Get manufacture orders
-app.get('/api/manufacture-orders', ensureAuthenticated, async (req, res) => {
-  try {
-    const data = await makeRequest('get', '/api/manufacture-orders', { 
-      params: req.query 
+    console.error('Error getting manufacture orders:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Get manufacture order by ID
-app.get('/api/manufacture-orders/:id', ensureAuthenticated, async (req, res) => {
+app.get('/mcp/purchase-orders', async (req, res) => {
   try {
-    const moId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(moId)) {
-      return res.status(400).json({ error: 'MO ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('get', `/api/manufacture-orders/${moId}`);
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Create manufacture order
-app.post('/api/manufacture-orders', ensureAuthenticated, async (req, res) => {
-  try {
-    // Manual validation
-    if (!isValidId(req.body.partId)) {
-      return res.status(400).json({ error: 'Part ID must be a positive integer' });
-    }
-    
-    if (!isValidNumber(req.body.quantity)) {
-      return res.status(400).json({ error: 'Quantity must be a number' });
-    }
-    
-    const data = await makeRequest('post', '/api/manufacture-orders', { 
-      data: req.body 
+    const result = await fishbowl.getPurchaseOrders(req.query);
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// MO Actions
-app.post('/api/manufacture-orders/:id/:action', ensureAuthenticated, async (req, res) => {
-  try {
-    const moId = req.params.id;
-    const action = req.params.action;
-    
-    // Manual validation
-    if (!isValidId(moId)) {
-      return res.status(400).json({ error: 'MO ID must be a positive integer' });
-    }
-    
-    const validActions = ['issue', 'unissue', 'close-short'];
-    if (!validActions.includes(action)) {
-      return res.status(400).json({ error: 'Invalid action' });
-    }
-    
-    const data = await makeRequest('post', `/api/manufacture-orders/${moId}/${action}`, { 
-      data: req.body || {} 
+    console.error('Error getting purchase orders:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Delete manufacture order
-app.delete('/api/manufacture-orders/:id', ensureAuthenticated, async (req, res) => {
+// Add inventory endpoint
+app.post('/mcp/inventory/add', async (req, res) => {
   try {
-    const moId = req.params.id;
+    const { partId, locationId, quantity, trackingItems } = req.body;
     
-    // Manual validation
-    if (!isValidId(moId)) {
-      return res.status(400).json({ error: 'MO ID must be a positive integer' });
-    }
-    
-    const data = await makeRequest('delete', `/api/manufacture-orders/${moId}`);
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Generic Memo Handler
-const handleMemos = (type) => {
-  const router = express.Router({ mergeParams: true });
-  
-  // Get memos
-  router.get('/', ensureAuthenticated, async (req, res) => {
-    try {
-      const id = req.params.id;
-      
-      // Manual validation
-      if (!isValidId(id)) {
-        return res.status(400).json({ error: 'ID must be a positive integer' });
-      }
-      
-      const data = await makeRequest('get', `/api/${type}/${id}/memos`);
-      
-      res.json(data);
-    } catch (error) {
-      sendErrorResponse(res, error);
-    }
-  });
-  
-  // Get memo by ID
-  router.get('/:memoId', ensureAuthenticated, async (req, res) => {
-    try {
-      const id = req.params.id;
-      const memoId = req.params.memoId;
-      
-      // Manual validation
-      if (!isValidId(id)) {
-        return res.status(400).json({ error: 'ID must be a positive integer' });
-      }
-      
-      if (!isValidId(memoId)) {
-        return res.status(400).json({ error: 'Memo ID must be a positive integer' });
-      }
-      
-      const data = await makeRequest('get', `/api/${type}/${id}/memos/${memoId}`);
-      
-      res.json(data);
-    } catch (error) {
-      sendErrorResponse(res, error);
-    }
-  });
-  
-  // Create memo
-  router.post('/', ensureAuthenticated, async (req, res) => {
-    try {
-      const id = req.params.id;
-      
-      // Manual validation
-      if (!isValidId(id)) {
-        return res.status(400).json({ error: 'ID must be a positive integer' });
-      }
-      
-      if (!isValidString(req.body.text)) {
-        return res.status(400).json({ error: 'Memo text is required' });
-      }
-      
-      const data = await makeRequest('post', `/api/${type}/${id}/memos`, { 
-        data: req.body 
-      });
-      
-      res.json(data);
-    } catch (error) {
-      sendErrorResponse(res, error);
-    }
-  });
-  
-  // Update memo
-  router.post('/:memoId', ensureAuthenticated, async (req, res) => {
-    try {
-      const id = req.params.id;
-      const memoId = req.params.memoId;
-      
-      // Manual validation
-      if (!isValidId(id)) {
-        return res.status(400).json({ error: 'ID must be a positive integer' });
-      }
-      
-      if (!isValidId(memoId)) {
-        return res.status(400).json({ error: 'Memo ID must be a positive integer' });
-      }
-      
-      if (!isValidString(req.body.text)) {
-        return res.status(400).json({ error: 'Memo text is required' });
-      }
-      
-      const data = await makeRequest('post', `/api/${type}/${id}/memos/${memoId}`, { 
-        data: req.body 
-      });
-      
-      res.json(data);
-    } catch (error) {
-      sendErrorResponse(res, error);
-    }
-  });
-  
-  // Delete memo
-  router.delete('/:memoId', ensureAuthenticated, async (req, res) => {
-    try {
-      const id = req.params.id;
-      const memoId = req.params.memoId;
-      
-      // Manual validation
-      if (!isValidId(id)) {
-        return res.status(400).json({ error: 'ID must be a positive integer' });
-      }
-      
-      if (!isValidId(memoId)) {
-        return res.status(400).json({ error: 'Memo ID must be a positive integer' });
-      }
-      
-      const data = await makeRequest('delete', `/api/${type}/${id}/memos/${memoId}`);
-      
-      res.json(data);
-    } catch (error) {
-      sendErrorResponse(res, error);
-    }
-  });
-  
-  return router;
-};
-
-// Apply memo routes
-app.use('/api/purchase-orders/:id/memos', handleMemos('purchase-orders'));
-app.use('/api/manufacture-orders/:id/memos', handleMemos('manufacture-orders'));
-
-// Products Endpoints
-
-// Get product best price
-app.get('/api/products/:id/best-price', ensureAuthenticated, async (req, res) => {
-  try {
-    const productId = req.params.id;
-    
-    // Manual validation
-    if (!isValidId(productId)) {
-      return res.status(400).json({ error: 'Product ID must be a positive integer' });
+    if (!partId || !locationId || quantity === undefined) {
+      throw new Error('partId, locationId, and quantity are required to add inventory');
     }
     
-    const data = await makeRequest('get', `/api/products/${productId}/best-price`, { 
-      params: req.query 
+    const result = await fishbowl.addInventory(partId, locationId, quantity, trackingItems || []);
+    
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
   } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// UOM Endpoints
-
-// Get UOMs
-app.get('/api/uoms', ensureAuthenticated, async (req, res) => {
-  try {
-    const data = await makeRequest('get', '/api/uoms', { 
-      params: req.query 
+    console.error('Error adding inventory:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
   }
 });
 
-// Vendor Endpoints
-
-// Get vendors
-app.get('/api/vendors', ensureAuthenticated, async (req, res) => {
-  try {
-    const data = await makeRequest('get', '/api/vendors', { 
-      params: req.query 
-    });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// User Endpoints
-
-// Get users
-app.get('/api/users', ensureAuthenticated, async (req, res) => {
-  try {
-    const data = await makeRequest('get', '/api/users', { 
-      params: req.query 
-    });
-    
-    res.json(data);
-  } catch (error) {
-    sendErrorResponse(res, error);
-  }
-});
-
-// Add error handling middleware
-app.use(errorHandler);
-
-// 404 handler
-app.use((req, res, next) => {
-  res.status(404).json({ 
-    error: 'Not Found', 
-    message: `Route ${req.method} ${req.url} not found` 
+// Catch-all route for 404 errors
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `Route ${req.method} ${req.path} not found`,
+    timestamp: new Date().toISOString()
   });
 });
 
-// Process uncaught exceptions and unhandled rejections
-process.on('uncaughtException', (error) => {
-  console.error('UNCAUGHT EXCEPTION:', error);
-  console.error('Stack trace:', error.stack);
-  // Keep the process alive but log the error
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('UNHANDLED REJECTION at:', promise);
-  console.error('Reason:', reason);
-  // Keep the process alive but log the error
-});
-
-// Create a graceful shutdown function
-const gracefulShutdown = () => {
-  console.log('Shutting down gracefully...');
-  
-  // Attempt to logout if we have a token
-  if (fishbowlToken) {
-    axios.post(`${FISHBOWL_API_URL}/api/logout`, {}, {
-      headers: {
-        'Authorization': `Bearer ${fishbowlToken}`,
-        'Content-Type': 'application/json'
-      }
-    }).catch(() => {
-      console.log('Logout failed during shutdown, but continuing shutdown process');
-    });
-  }
-  
-  // Exit the process
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  fishbowl.disconnect();
   process.exit(0);
-};
-
-// Listen for termination signals
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
-
-// Start server and handle errors
-const server = app.listen(PORT, () => {
-  console.log(`MCP Server listening on port ${PORT}`);
-  
-  // Try to login on startup
-  login().catch(err => {
-    console.error('Initial login failed:', err.message);
-    console.log('Server will attempt to login again when handling requests');
-  });
 });
 
-// Handle server errors
-server.on('error', (error) => {
-  console.error('Server error:', error);
-  if (error.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Please choose a different port.`);
-    process.exit(1);
-  }
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  fishbowl.disconnect();
+  process.exit(0);
 });
 
-// Export for testing purposes
-module.exports = app;
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`MCP Fishbowl Server running on port ${PORT}`);
+  console.log(`Configured to connect to Fishbowl at ${fishbowl.host}:${fishbowl.port}`);
+});
